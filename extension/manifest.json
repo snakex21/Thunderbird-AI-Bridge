@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Thunderbird AI Bridge",
-  "version": "0.9.18",
+  "version": "0.9.21",
   "description": "Local Thunderbird bridge for AI agents, CLIs and automation: mailbox search, message reading, attachments, folder operations, import, verified deletion and native IMAP maintenance.",
   "applications": {
     "gecko": {

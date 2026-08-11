@@ -5,14 +5,14 @@ var { MailServices } = ChromeUtils.importESModule(
   "resource:///modules/MailServices.sys.mjs"
 );
 
-async function runFolderUrl(start, label) {
+async function runFolderUrl(start, label, timeoutMs = 90000) {
   await new Promise((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       reject(new Error(`Timeout podczas ${label}.`));
-    }, 90000);
+    }, timeoutMs);
 
     const listener = {
       onStartRunningUrl() {},
@@ -132,10 +132,69 @@ var mailbridge = class extends ExtensionCommon.ExtensionAPI {
             throw new Error(`Nie znaleziono natywnego folderu Thunderbird: ${accountId} ${path}`);
           }
 
-          await runFolderUrl((listener) => folder.compact(listener, null), "IMAP EXPUNGE/compact");
+          let beforeBytes = 0;
+          try { beforeBytes = Number(folder.filePath?.fileSize) || 0; } catch (_) {}
+          let beforeExpungedBytes = 0;
+          try { beforeExpungedBytes = Number(folder.expungedBytes) || 0; } catch (_) {}
+          if (beforeExpungedBytes <= 0) {
+            return {
+              beforeBytes,
+              afterBytes: beforeBytes,
+              reclaimedBytes: 0,
+              beforeExpungedBytes,
+              afterExpungedBytes: beforeExpungedBytes,
+              skipped: true,
+            };
+          }
+
+          let terminalStatus = null;
+          const listener = {
+            onStartRunningUrl() {},
+            onStopRunningUrl(url, status) { terminalStatus = Number(status); },
+            QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+          };
+          folder.compact(listener, null);
+
+          // TB 153 can finish rewriting the mbox and reset expungedBytes but
+          // omit the URL-listener callback. Observe the authoritative folder
+          // state as a fallback instead of timing out after successful I/O.
+          const deadline = Date.now() + 10 * 60 * 1000;
+          let lastObservedBytes = beforeBytes;
+          let stableShrunkSamples = 0;
+          for (;;) {
+            let afterExpungedBytes = beforeExpungedBytes;
+            try { afterExpungedBytes = Number(folder.expungedBytes) || 0; } catch (_) {}
+            let observedBytes = beforeBytes;
+            try { observedBytes = Number(folder.filePath?.fileSize) || 0; } catch (_) {}
+            if (observedBytes < beforeBytes && observedBytes === lastObservedBytes) {
+              stableShrunkSamples++;
+            } else {
+              stableShrunkSamples = 0;
+            }
+            lastObservedBytes = observedBytes;
+            if (terminalStatus !== null && !Components.isSuccessCode(terminalStatus)) {
+              throw new Error(`IMAP EXPUNGE/compact failed: 0x${Number(terminalStatus >>> 0).toString(16)}`);
+            }
+            if (terminalStatus !== null || afterExpungedBytes <= 0 || stableShrunkSamples >= 4) break;
+            if (Date.now() >= deadline) {
+              throw new Error("IMAP EXPUNGE/compact timed out: Thunderbird did not finish compaction.");
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
           try { folder.updateFolder(null); } catch (_) {}
           await new Promise((resolve) => setTimeout(resolve, 1500));
-          return true;
+          let afterBytes = 0;
+          try { afterBytes = Number(folder.filePath?.fileSize) || 0; } catch (_) {}
+          let afterExpungedBytes = 0;
+          try { afterExpungedBytes = Number(folder.expungedBytes) || 0; } catch (_) {}
+          return {
+            beforeBytes,
+            afterBytes,
+            reclaimedBytes: Math.max(0, beforeBytes - afterBytes),
+            beforeExpungedBytes,
+            afterExpungedBytes,
+            skipped: false,
+          };
         },
 
         async emptyTrashAndRefresh(accountId, path) {

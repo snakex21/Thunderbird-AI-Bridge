@@ -12,7 +12,7 @@ It is **not tied to one AI model, one CLI or one cloud provider**. The Thunderbi
 
 The project is designed for local-first use: Thunderbird talks to `127.0.0.1`, so mailbox access does not need to be exposed directly to the network.
 
-> Status: experimental, currently based on the working `0.9.18` bridge. The protocol may still change before `1.0`.
+> Status: experimental, currently based on the working `0.9.21` bridge. The protocol may still change before `1.0`.
 
 ## Why this exists
 
@@ -32,6 +32,7 @@ That means one bridge can potentially be used by:
 - list configured mail accounts,
 - list folders and folder capabilities,
 - create, rename and delete folders,
+- compact one folder with explicit confirmation and report reclaimed local bytes,
 - search messages by sender, recipient/address, subject, full text and date,
 - count matching messages,
 - group messages by sender,
@@ -87,6 +88,7 @@ Mailbox mutations are deliberately stricter than reads.
 - permanent deletion is restricted to Thunderbird's Trash folder,
 - bulk operations are processed in bounded batches,
 - IMAP permanent deletion is verified after Thunderbird performs its server-side operation,
+- folder compaction skips folders without expunged bytes and never intentionally changes current messages,
 - system/root folders are protected from rename/delete operations.
 
 A host application should still ask the user before destructive actions. The extension-side checks are a second safety layer, not a replacement for good agent behavior.

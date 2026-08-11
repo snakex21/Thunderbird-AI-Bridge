@@ -428,6 +428,33 @@ async function executeRequest(request) {
     };
   }
 
+  if (op === "compact_folder") {
+    if (!args.confirm) {
+      throw new Error("compact_folder requires confirm:true after explicit user approval.");
+    }
+    const account = await resolveAccount(args);
+    const folder = await resolveFolder(account, args.folder);
+    if (!folder || folder.path === "/") {
+      throw new Error("compact_folder requires a specific folder other than the account root.");
+    }
+    if (!messenger.mailbridge?.compactAndRefresh) {
+      throw new Error("Native compaction is unavailable. Update the bridge and restart Thunderbird.");
+    }
+    const measurement = await messenger.mailbridge.compactAndRefresh(folder.accountId, folder.path);
+    return {
+      account: { id: account.id, name: account.name, type: account.type },
+      folder: plainFolder(folder),
+      compacted: true,
+      beforeBytes: Number(measurement?.beforeBytes) || 0,
+      afterBytes: Number(measurement?.afterBytes) || 0,
+      reclaimedBytes: Number(measurement?.reclaimedBytes) || 0,
+      beforeExpungedBytes: Number(measurement?.beforeExpungedBytes) || 0,
+      afterExpungedBytes: Number(measurement?.afterExpungedBytes) || 0,
+      skipped: measurement?.skipped === true,
+      messagesChanged: false,
+    };
+  }
+
   if (op === "create_folder") {
     if (!args.confirm) throw new Error("create_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     const account = await resolveAccount(args);

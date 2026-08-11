@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.21 - 2026-08-11
+
+### Added
+
+- explicit `compact_folder` operation guarded by `confirm: true`,
+- before/after byte measurements and reclaimed-space reporting,
+- regression coverage for create, rename, compact and delete sequencing.
+
+### Fixed
+
+- successful Thunderbird 153 compaction no longer times out when its URL listener callback is omitted,
+- folders with no expunged bytes are skipped instead of performing unnecessary I/O,
+- compaction waits for a stable shrunken mbox as a native completion fallback.
+
 ## 0.9.18 - 2026-08-11
 
 Initial public-repository baseline based on the working Thunderbird bridge build.

@@ -39,6 +39,6 @@ npm test
 
 XPI se vytvoří v `dist/thunderbird-ai-bridge.xpi` a lze jej ručně nainstalovat přes správce doplňků Thunderbird.
 
-Stav: experimentální (`0.9.18`). Protokol se může před `1.0` změnit.
+Stav: experimentální (`0.9.21`). Protokol se může před `1.0` změnit.
 
 Licence MIT. Nezávislý projekt, není oficiálně spojen s Mozillou ani Thunderbirdem.

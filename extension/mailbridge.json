@@ -20,7 +20,18 @@
         "parameters": [
           {"name": "accountId", "type": "string"},
           {"name": "path", "type": "string"}
-        ]
+        ],
+        "returns": {
+          "type": "object",
+          "properties": {
+            "beforeBytes": {"type": "number"},
+            "afterBytes": {"type": "number"},
+            "reclaimedBytes": {"type": "number"},
+            "beforeExpungedBytes": {"type": "number"},
+            "afterExpungedBytes": {"type": "number"},
+            "skipped": {"type": "boolean"}
+          }
+        }
       },
       {
         "name": "emptyTrashAndRefresh",

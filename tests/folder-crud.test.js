@@ -54,6 +54,11 @@ const messenger = {
       folders = folders.filter((folder) => folder.path !== folderPath);
       return "";
     },
+    compactAndRefresh: async (accountId, folderPath) => {
+      assert.equal(accountId, account.id);
+      assert.ok(folders.some((folder) => folder.path === folderPath));
+      return { beforeBytes: 1000, afterBytes: 400, reclaimedBytes: 600 };
+    },
   },
   messages: {},
 };
@@ -82,6 +87,14 @@ vm.runInContext(background, context, { filename: "background.js" });
   });
   assert.equal(renamed.renamed.name, "CRUD renamed");
 
+  const compacted = await context.executeRequest({
+    op: "compact_folder",
+    args: { folder: renamed.renamed.id, confirm: true },
+  });
+  assert.equal(compacted.compacted, true);
+  assert.equal(compacted.reclaimedBytes, 600);
+  assert.equal(compacted.messagesChanged, false);
+
   const deleted = await context.executeRequest({
     op: "delete_folder",
     args: { folder: renamed.renamed.id, confirm: true },
@@ -89,7 +102,7 @@ vm.runInContext(background, context, { filename: "background.js" });
   assert.equal(deleted.deleted, true);
   assert.equal(deleted.serverVerified, true);
   assert.equal(folders.length, 0);
-  console.log("PASS Thunderbird folder create -> rename -> native IMAP delete");
+  console.log("PASS Thunderbird folder create -> rename -> compact -> native IMAP delete");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
