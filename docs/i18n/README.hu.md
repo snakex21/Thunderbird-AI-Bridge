@@ -39,6 +39,6 @@ npm test
 
 Az XPI a `dist/thunderbird-ai-bridge.xpi` fájlba készül, és manuálisan telepíthető a Thunderbird kiegészítőkezelőjéből.
 
-Állapot: kísérleti (`0.9.18`). A protokoll `1.0` előtt még változhat.
+Állapot: kísérleti (`0.9.21`). A protokoll `1.0` előtt még változhat.
 
 MIT licenc. Független projekt, nem a Mozilla vagy a Thunderbird hivatalos projektje.

@@ -39,6 +39,6 @@ npm test
 
 XPI dibina di `dist/thunderbird-ai-bridge.xpi` dan boleh dipasang secara manual melalui pengurus add-on Thunderbird.
 
-Status: eksperimen (`0.9.18`). Protokol mungkin berubah sebelum `1.0`.
+Status: eksperimen (`0.9.21`). Protokol mungkin berubah sebelum `1.0`.
 
 Lesen MIT. Projek bebas dan bukan projek rasmi Mozilla atau Thunderbird.

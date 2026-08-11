@@ -39,6 +39,6 @@ npm test
 
 XPI は `dist/thunderbird-ai-bridge.xpi` に生成され、Thunderbird のアドオンマネージャーから手動でインストールできます。
 
-状態: experimental (`0.9.18`)。`1.0` まではプロトコルが変更される可能性があります。
+状態: experimental (`0.9.21`)。`1.0` まではプロトコルが変更される可能性があります。
 
 MIT License。Mozilla または Thunderbird の公式プロジェクトではありません。

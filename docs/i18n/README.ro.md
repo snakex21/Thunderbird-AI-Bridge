@@ -39,6 +39,6 @@ npm test
 
 XPI-ul este generat în `dist/thunderbird-ai-bridge.xpi` și poate fi instalat manual din managerul de add-on-uri Thunderbird.
 
-Stare: experimental (`0.9.18`). Protocolul se poate modifica înainte de `1.0`.
+Stare: experimental (`0.9.21`). Protocolul se poate modifica înainte de `1.0`.
 
 Licență MIT. Proiect independent, fără afiliere oficială cu Mozilla sau Thunderbird.

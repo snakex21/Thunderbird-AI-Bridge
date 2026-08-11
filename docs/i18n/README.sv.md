@@ -39,6 +39,6 @@ npm test
 
 XPI-filen skapas i `dist/thunderbird-ai-bridge.xpi` och kan installeras manuellt via Thunderbirds tilläggshanterare.
 
-Status: experimentell (`0.9.18`). Protokollet kan ändras före `1.0`.
+Status: experimentell (`0.9.21`). Protokollet kan ändras före `1.0`.
 
 MIT-licens. Oberoende projekt, inte officiellt knutet till Mozilla eller Thunderbird.

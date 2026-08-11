@@ -39,6 +39,6 @@ npm test
 
 XPI তৈরি হবে `dist/thunderbird-ai-bridge.xpi`-এ এবং Thunderbird Add-ons Manager থেকে manually install করা যাবে।
 
-অবস্থা: experimental (`0.9.18`)। `1.0`-এর আগে protocol পরিবর্তিত হতে পারে।
+অবস্থা: experimental (`0.9.21`)। `1.0`-এর আগে protocol পরিবর্তিত হতে পারে।
 
 MIT License। এটি Mozilla বা Thunderbird-এর অফিসিয়াল প্রকল্প নয়।

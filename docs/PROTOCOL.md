@@ -1,6 +1,6 @@
 # Thunderbird AI Bridge protocol
 
-This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.18` implementation.
+This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.21` implementation.
 
 ## Transport
 
@@ -97,6 +97,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `create_folder`
 - `rename_folder`
 - `delete_folder`
+- `compact_folder`
 - `import_msg`
 - `move`
 - `trash`
@@ -169,6 +170,8 @@ The extension uploads the attachment to `/attachment-file` and returns a `transf
 `create_folder`, `rename_folder` and `delete_folder` use Thunderbird APIs plus a native experiment layer for IMAP cases where Thunderbird's high-level extension API needs explicit refresh/verification.
 
 System/root folders are protected from rename/delete actions.
+
+`compact_folder` requires `folder` and `confirm: true`. It invokes Thunderbird's native compaction for one folder, skips work when Thunderbird reports no expunged bytes, and returns `beforeBytes`, `afterBytes`, `reclaimedBytes`, `beforeExpungedBytes`, `afterExpungedBytes`, `skipped` and `messagesChanged: false`. It is intended as occasional maintenance after a cleanup, not after every mutation batch.
 
 ## Bulk message operations
 
