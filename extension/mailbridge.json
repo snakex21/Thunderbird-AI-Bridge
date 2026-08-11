@@ -1,0 +1,46 @@
+[
+  {
+    "namespace": "mailbridge",
+    "functions": [
+      {
+        "name": "renameFolderAndRefresh",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "accountId", "type": "string"},
+          {"name": "path", "type": "string"},
+          {"name": "newName", "type": "string"}
+        ],
+        "returns": {"type": "string"}
+      },
+      {
+        "name": "compactAndRefresh",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "accountId", "type": "string"},
+          {"name": "path", "type": "string"}
+        ]
+      },
+      {
+        "name": "emptyTrashAndRefresh",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "accountId", "type": "string"},
+          {"name": "path", "type": "string"}
+        ]
+      },
+      {
+        "name": "deleteFolderAndRefresh",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "accountId", "type": "string"},
+          {"name": "path", "type": "string"}
+        ],
+        "returns": {"type": "string"}
+      }
+    ]
+  }
+]

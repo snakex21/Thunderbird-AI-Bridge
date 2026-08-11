@@ -1,0 +1,11 @@
+{
+  "name": "thunderbird-ai-bridge",
+  "version": "0.9.18",
+  "private": true,
+  "description": "Local Thunderbird bridge for AI agents, CLIs and automation tools.",
+  "scripts": {
+    "test": "node tests/folder-crud.test.js && node tests/message-read.test.js",
+    "build:xpi": "python scripts/build_xpi.py"
+  },
+  "license": "MIT"
+}
