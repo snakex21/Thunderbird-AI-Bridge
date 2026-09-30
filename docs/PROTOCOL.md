@@ -214,3 +214,52 @@ The host is free to expose any interface on its other side: CLI commands, MCP to
 ## Compatibility
 
 The protocol is experimental until `1.0`. If you build another host implementation, pin the extension version and expect small field/operation changes while the API is being cleaned up.
+
+## Result delivery and uncertain outcomes
+
+Execution and delivery are separate. The extension serializes the operation result
+once, then retries only `POST /result` (up to three attempts, five-second HTTP
+timeout, 250 ms then 1 s delays). A network error or lost acknowledgement never
+turns successful execution into an operation-failed payload. HTTP 4xx except
+408/429 stops delivery retries. Unacknowledged results remain available for a
+same-ID redelivery, but there is no automatic re-execution or indefinite HTTP
+retry loop.
+
+A request ID identifies one operation. For admitted requests, while retained, duplicate IDs queued,
+executing, or completed never execute again; a completed duplicate replays the
+identical serialized result. Changing arguments under an existing ID does not
+change that operation. A genuinely new ID is a new operation even with identical
+arguments. Hosts must never generate a new ID as an automatic retry of an
+uncertain mutation.
+
+The process-local recovery cache holds at most 128 IDs and 8 MiB of UTF-8 result
+payloads, reserving 4 MiB per admitted pending request. When either bound would
+be exceeded, a new request is left unadmitted and unexecuted, with no result
+posted; its caller may time out. Sending a terminal rejection without remembering
+its ID would be unsafe, because a later same-ID arrival could execute after that
+rejection. A never-admitted ID has no completed operation to replay and may be
+admitted later. Polling continues so retained IDs can still recover at capacity. Results exceeding the
+4 MiB host transport limit, or failing serialization, produce an explicit
+outcome-unknown response; the operation may already have executed. Temporary
+serialization buffers and request arguments are not included in this result-byte
+budget. No mailbox payloads or recovery records are persisted to disk.
+
+Acknowledged entries expire five minutes after their first acknowledgement.
+Unacknowledged entries do not expire or get evicted to admit new work; a full
+cache applies backpressure. A permanently unavailable original host can therefore
+leave unresolved entries until extension restart. Restart clears recovery state,
+so reconcile mailbox state before repeating uncertain mutations. The endpoint
+and token are immutable constants for the background process, not runtime
+settings; recovery payloads are sent only to that original configured endpoint.
+This is not durable exactly-once execution: restart/crash, retention expiry,
+and genuinely new IDs are outside the deduplication guarantee.
+
+SuperCLI's host acknowledges an identical repeated result for a recently completed
+ID (up to 256 SHA-256 digests, five-minute window). A conflicting result receives
+409 and an unknown/expired ID receives 404. A late result after the caller has
+timed out may therefore be unacknowledged. The host removes cancelled queued
+requests before dispatch; after dispatch a timeout/cancellation is reported as
+outcome unknown with the request ID and a warning against automatic mutation
+retries. An HTTP acknowledgement means the host accepted the result, not that a
+caller definitely displayed it. Neither host nor extension can infer that a
+mailbox operation failed just because its caller stopped waiting.

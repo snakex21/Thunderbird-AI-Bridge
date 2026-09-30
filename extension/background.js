@@ -1021,20 +1021,94 @@ async function executeRequest(request) {
   throw new Error(`Nieznana operacja Thunderbird Bridge: ${op}`);
 }
 
-async function postResult(payload) {
-  const response = await fetch(`${BRIDGE_URL}/result?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) throw new Error(`Bridge result HTTP ${response.status}`);
+// Process-local only: no mailbox results are written to disk. IDs remain
+// retained until acknowledged; acknowledged results expire after five minutes.
+// Reserve a protocol-sized result before execution rather than evicting an
+// unacknowledged operation to admit a new one.
+const RESULT_TTL_MS = 5 * 60 * 1000;
+const RESULT_RECORD_LIMIT = 128;
+const RESULT_BYTE_LIMIT = 8 * 1024 * 1024;
+const RESULT_MAX_BYTES = 4 * 1024 * 1024;
+const requestRecords = new Map();
+let resultBytes = 0;
+let reservedBytes = 0;
+let capacityWarningShown = false;
+
+function hasRequestCapacity() {
+  return requestRecords.size < RESULT_RECORD_LIMIT && resultBytes + reservedBytes + RESULT_MAX_BYTES <= RESULT_BYTE_LIMIT;
+}
+
+function pruneRequestRecords() {
+  const now = Date.now();
+  for (const [id, record] of requestRecords) {
+    if (!record.queued && record.acknowledged && record.completedAt !== null && now - record.acknowledgedAt >= RESULT_TTL_MS) {
+      resultBytes -= record.bytes;
+      requestRecords.delete(id);
+    }
+  }
+}
+
+async function postResult(body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${BRIDGE_URL}/result?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const error = new Error(`Bridge result HTTP ${response.status}`);
+      error.permanent = response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status);
+      throw error;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function deliverResult(body) {
+  // Retry the exact serialized result, never executeRequest. In particular a
+  // delivery error must not be replaced with a false operation-failed result.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await postResult(body);
+      return true;
+    } catch (error) {
+      if (error.permanent || attempt === 2) {
+        console.warn("Thunderbird Bridge result delivery unacknowledged; operation must not be automatically repeated.");
+        return false;
+      }
+      await sleep(attempt === 0 ? 250 : 1000);
+    }
+  }
 }
 
 const requestQueue = [];
 let requestWorkerRunning = false;
 
 function enqueueRequest(request) {
-  requestQueue.push(request);
+  if (typeof request?.id !== "string" || !request.id || request.id.length > 256) return;
+  pruneRequestRecords();
+  let record = requestRecords.get(request.id);
+  if (record?.queued) return;
+  if (!record) {
+    // Never send a terminal rejection without retaining its ID: a later
+    // same-ID arrival could otherwise execute after the host accepted failure.
+    // No admission means no side effect and no result; the caller may time out.
+    if (!hasRequestCapacity()) {
+      if (!capacityWarningShown) console.warn("Thunderbird Bridge recovery capacity exhausted; new requests are not admitted.");
+      capacityWarningShown = true;
+      return false;
+    }
+    capacityWarningShown = false;
+    record = { body: null, bytes: 0, completedAt: null, queued: false, acknowledged: false, acknowledgedAt: null };
+    reservedBytes += RESULT_MAX_BYTES;
+    requestRecords.set(request.id, record);
+  }
+  record.queued = true;
+  requestQueue.push({ request, record });
   if (!requestWorkerRunning) void requestWorker();
 }
 
@@ -1043,15 +1117,36 @@ async function requestWorker() {
   requestWorkerRunning = true;
   try {
     while (requestQueue.length) {
-      const request = requestQueue.shift();
-      try {
-        const data = await executeRequest(request);
-        await postResult({ id: request.id, ok: true, data });
-      } catch (error) {
+      const { request, record } = requestQueue.shift();
+      let body = record.body;
+      if (record.completedAt === null) {
+        let payload;
         try {
-          await postResult({ id: request.id, ok: false, error: String(error?.message || error) });
-        } catch (_) {}
+          payload = { id: request.id, ok: true, data: await executeRequest(request) };
+        } catch (error) {
+          payload = { id: request.id, ok: false, error: String(error?.message || error) };
+        }
+        try {
+          body = JSON.stringify(payload);
+        } catch (_) {
+          body = JSON.stringify({ id: request.id, ok: false, error: "Operation finished but its result could not be serialized; outcome unknown. Do not automatically repeat mutations." });
+        }
+        let bytes = new TextEncoder().encode(body).length;
+        if (bytes > RESULT_MAX_BYTES) {
+          body = JSON.stringify({ id: request.id, ok: false, error: "Operation finished but its result exceeded the bridge transport limit; outcome unknown. Do not automatically repeat mutations." });
+          bytes = new TextEncoder().encode(body).length;
+        }
+        record.completedAt = Date.now();
+        record.body = body;
+        record.bytes = bytes;
+        reservedBytes -= RESULT_MAX_BYTES;
+        resultBytes += bytes;
       }
+      if (await deliverResult(body)) {
+        if (!record.acknowledged) record.acknowledgedAt = Date.now();
+        record.acknowledged = true;
+      }
+      record.queued = false;
     }
   } finally {
     requestWorkerRunning = false;
@@ -1061,6 +1156,7 @@ async function requestWorker() {
 
 async function bridgeLoop() {
   for (;;) {
+    pruneRequestRecords();
     try {
       const response = await fetch(`${BRIDGE_URL}/poll?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
         cache: "no-store",

@@ -4,7 +4,7 @@
   "private": true,
   "description": "Local Thunderbird bridge for AI agents, CLIs and automation tools.",
   "scripts": {
-    "test": "node tests/folder-crud.test.js && node tests/message-read.test.js && node --test tests/mutation-safety.test.js",
+    "test": "node tests/folder-crud.test.js && node tests/message-read.test.js && node --test tests/mutation-safety.test.js && node --test tests/result-delivery.test.js",
     "build:xpi": "python scripts/build_xpi.py"
   },
   "license": "MIT"
