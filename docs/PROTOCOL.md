@@ -106,7 +106,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `purge`
 - `delete_permanently`
 
-Mutating operations that can change or destroy user data require `confirm: true` where enforced by the extension.
+Mutating operations require the JSON boolean `confirm: true`. Strings such as `"true"` or `"false"`, numbers and other truthy values are rejected.
 
 ## Common search arguments
 
@@ -140,6 +140,10 @@ Example:
   }
 }
 ```
+
+Account and folder selectors must be unambiguous. Automatic Inbox/Trash resolution also rejects multiple special-use matches or ambiguous fallback names. Exact account/folder IDs take precedence over display names; exact folder paths take precedence over name matching. If multiple accounts or folders match a friendly name, use an ID from `accounts`/`folders` or an exact full folder path. A missing Inbox is an error, not an implicit account-wide search; use `scope: "account"` explicitly for account-wide reads.
+
+`address` performs a sender-or-recipient search and overrides `from`/`author` and `to`/`recipient`. Other filters (subject, text and dates) still apply. The same matching semantics apply to bulk mutations.
 
 ## Reading a message
 
@@ -184,7 +188,7 @@ System/root folders are protected from rename/delete actions.
 }
 ```
 
-The host should send the returned continuation token with the same operation and filters to process the next batch. Continuation tokens expire and are tied to an operation fingerprint to reduce accidental filter changes during a destructive job.
+The host should send the returned continuation token with the same operation and filters to process the next batch. Continuation tokens expire and are tied to the operation, account, source, resolved destination ID (including default Trash/Inbox destinations), supplied destination selector, sender, recipient, address, subject, text, dates and subfolder scope to reduce accidental filter changes during a destructive job. A mismatched request is rejected without consuming its valid token. Bulk filters may use `from`/`author`, `to`/`recipient`, `address`, `subject`, `fullText`/`text`, `since` or `until`.
 
 `dry_run: true` can be used by supported bulk operations to inspect how many messages would be affected before performing the mutation.
 
@@ -192,7 +196,9 @@ The host should send the returned continuation token with the same operation and
 
 Permanent deletion is deliberately restricted to Thunderbird's default Trash folder. On IMAP accounts the bridge uses Thunderbird's native compact/EXPUNGE behavior and verifies mailbox state before reporting final success where possible.
 
-`empty_trash` uses Thunderbird's native server-side Empty Trash operation.
+`empty_trash` uses Thunderbird's native server-side Empty Trash operation. If messages remain after refresh, it returns `serverVerified: false` and `status: "verification_failed"`.
+
+A purge whose native compaction was skipped cannot confirm server EXPUNGE: it returns `serverVerified: false`, `pendingExpunge: true` and, when matching messages are locally gone, `status: "server_expunge_not_confirmed"`. A refresh error also leaves `pendingExpunge: true`. Hosts must inspect verification/status fields rather than treating transport `ok: true` as proof of permanent deletion.
 
 ## Host implementation guidance
 

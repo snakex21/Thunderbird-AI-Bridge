@@ -209,12 +209,12 @@ async function resolveAccount(args = {}) {
   if (!accounts.length) throw new Error("Thunderbird nie ma skonfigurowanego konta pocztowego.");
   const wanted = String(args.account || args.accountId || "").trim().toLowerCase();
   if (wanted) {
-    const found = accounts.find((account) =>
-      String(account.id || "").toLowerCase() === wanted ||
-      String(account.name || "").toLowerCase().includes(wanted)
-    );
-    if (!found) throw new Error(`Nie znaleziono konta: ${args.account || args.accountId}`);
-    return found;
+    const byId = accounts.find(account => String(account.id || "") === String(args.account || args.accountId).trim());
+    if (byId) return byId;
+    const matches = accounts.filter(account => String(account.name || "").toLowerCase().includes(wanted));
+    if (!matches.length) throw new Error(`Nie znaleziono konta: ${args.account || args.accountId}`);
+    if (matches.length > 1) throw new Error("Niejednoznaczna nazwa konta; użyj accountId z operacji accounts.");
+    return matches[0];
   }
   return accounts.find((account) => String(account.type || "").toLowerCase() === "imap") || accounts[0];
 }
@@ -224,13 +224,19 @@ async function resolveFolder(account, raw) {
   if (!wanted) return null;
   const folders = await messenger.folders.query({ accountId: account.id });
   const needle = wanted.toLowerCase().replace(/\\/g, "/");
-  const exact = folders.find((folder) => {
-    const id = String(folder.id || "").toLowerCase();
+  // Stable IDs and explicit full paths take precedence over friendly names.
+  const byId = folders.find(folder => String(folder.id || "") === wanted);
+  if (byId) return byId;
+  const normalizedPath = wanted.replace(/\\/g, "/");
+  const byPath = folders.find(folder => String(folder.path || "").replace(/\\/g, "/") === normalizedPath);
+  if (byPath) return byPath;
+  const matches = folders.filter((folder) => {
     const name = String(folder.name || "").toLowerCase();
     const path = String(folder.path || "").toLowerCase().replace(/\\/g, "/");
-    return id === needle || name === needle || path === needle || path.endsWith(`/${needle}`);
+    return name === needle || path === needle || path.endsWith(`/${needle}`);
   });
-  if (exact) return exact;
+  if (matches.length > 1) throw new Error("Niejednoznaczna nazwa folderu; użyj folder.id lub pełnej ścieżki z operacji folders.");
+  if (matches.length === 1) return matches[0];
   throw new Error(`Nie znaleziono folderu Thunderbird: ${wanted}`);
 }
 
@@ -241,6 +247,7 @@ async function buildMessageQuery(args = {}) {
   let folder = await resolveFolder(account, args.folder);
   if (!folder && scope !== "account") {
     folder = await resolveSpecialFolder(account, "inbox", ["inbox", "odebrane"]);
+    if (!folder) throw new Error("Nie znaleziono folderu Inbox/Odebrane; użyj scope:account, aby przeszukać całe konto.");
   }
   if (folder) {
     query.folderId = folder.id;
@@ -270,8 +277,8 @@ async function searchMessages(args = {}, max = Infinity) {
   // Thunderbird exposes sender and To-recipient as separate query fields.
   // Run both and merge so a user can simply say "find mail for this address"
   // without knowing whether the address was on the From or To side.
-  const senderArgs = { ...args, address: "", from: address, to: "" };
-  const recipientArgs = { ...args, address: "", from: "", to: address };
+  const senderArgs = { ...args, address: "", from: address, author: "", to: "", recipient: "" };
+  const recipientArgs = { ...args, address: "", from: "", author: "", to: address, recipient: "" };
   const senderBuilt = await buildMessageQuery(senderArgs);
   const recipientBuilt = await buildMessageQuery(recipientArgs);
   const [senderFirst, recipientFirst] = await Promise.all([
@@ -292,6 +299,8 @@ async function searchMessages(args = {}, max = Infinity) {
 
 function hasMutationFilter(args = {}) {
   return Boolean(
+    String(args.to || args.recipient || "").trim() ||
+    String(args.address || "").trim() ||
     String(args.from || args.author || "").trim() ||
     String(args.subject || "").trim() ||
     String(args.fullText || args.text || "").trim() ||
@@ -302,16 +311,19 @@ function hasMutationFilter(args = {}) {
 
 async function resolveSpecialFolder(account, specialUse, fallbackNames = []) {
   const folders = await messenger.folders.query({ accountId: account.id });
-  const bySpecial = folders.find((folder) =>
+  const bySpecial = folders.filter((folder) =>
     Array.isArray(folder.specialUse) && folder.specialUse.some((value) => String(value).toLowerCase() === specialUse)
   );
-  if (bySpecial) return bySpecial;
+  if (bySpecial.length > 1) throw new Error(`Niejednoznaczny folder systemowy ${specialUse}; sprawdź konfigurację konta.`);
+  if (bySpecial.length === 1) return bySpecial[0];
   const wanted = new Set(fallbackNames.map((name) => String(name).toLowerCase()));
-  return folders.find((folder) => {
+  const matches = folders.filter((folder) => {
     const name = String(folder.name || "").toLowerCase();
     const path = String(folder.path || "").toLowerCase();
     return wanted.has(name) || [...wanted].some((needle) => path.endsWith(`/${needle}`));
-  }) || null;
+  });
+  if (matches.length > 1) throw new Error(`Niejednoznaczny folder systemowy ${specialUse}; sprawdź konfigurację konta.`);
+  return matches[0] || null;
 }
 
 function mutationBatchSize(args = {}) {
@@ -331,30 +343,34 @@ function cleanupBulkContinuations() {
   }
 }
 
-function mutationFingerprint(op, account, source, args = {}) {
+function mutationFingerprint(op, account, source, args = {}, destination = null) {
   return JSON.stringify({
     op,
     accountId: account.id,
     folderId: source.id,
-    from: String(args.from || args.author || "").trim().toLowerCase(),
-    subject: String(args.subject || "").trim().toLowerCase(),
-    text: String(args.fullText || args.text || "").trim().toLowerCase(),
+    from: String(args.from || args.author || "").trim(),
+    to: String(args.to || args.recipient || "").trim(),
+    address: String(args.address || "").trim(),
+    includeSubFolders: Boolean(args.includeSubFolders),
+    subject: String(args.subject || "").trim(),
+    text: String(args.fullText || args.text || "").trim(),
     since: String(args.since || "").trim(),
     until: String(args.until || "").trim(),
-    destination: String(args.destination || "").trim().toLowerCase(),
+    destination: String(args.destination || "").trim(),
+    destinationId: destination?.id ?? null,
     all: args.all === true,
   });
 }
 
-function takeBulkState(op, args, account, source) {
+function takeBulkState(op, args, account, source, destination = null) {
   cleanupBulkContinuations();
-  const fingerprint = mutationFingerprint(op, account, source, args);
+  const fingerprint = mutationFingerprint(op, account, source, args, destination);
   const token = String(args.continuation || "").trim();
   if (!token) return { fingerprint, processed: 0, updatedAt: Date.now() };
   const state = bulkContinuations.get(token);
-  bulkContinuations.delete(token);
   if (!state) throw new Error("Token continuation wygasł albo nie istnieje. Zacznij zatwierdzoną operację od nowa.");
   if (state.fingerprint !== fingerprint) throw new Error("Token continuation nie pasuje do operacji lub filtrów. Przerwano dla bezpieczeństwa.");
+  bulkContinuations.delete(token);
   state.updatedAt = Date.now();
   return state;
 }
@@ -367,9 +383,9 @@ function saveBulkState(op, state) {
 }
 
 async function mutationMessages(args = {}, defaultFolder = "inbox", allowWholeFolder = false) {
-  if (!args.confirm) throw new Error("Ta operacja wymaga confirm:true po wyraźnej zgodzie użytkownika.");
+  if (args.confirm !== true) throw new Error("Ta operacja wymaga confirm:true po wyraźnej zgodzie użytkownika.");
   if (!hasMutationFilter(args) && !(allowWholeFolder && args.all === true)) {
-    throw new Error("Ta operacja wymaga filtra: from/subject/text/since/until.");
+    throw new Error("Ta operacja wymaga filtra: from/to/address/subject/text/since/until.");
   }
   const account = await resolveAccount(args);
   let source = await resolveFolder(account, args.folder);
@@ -382,9 +398,7 @@ async function mutationMessages(args = {}, defaultFolder = "inbox", allowWholeFo
   if (!source) throw new Error(`Nie znaleziono folderu źródłowego (${defaultFolder}).`);
   const batchSize = mutationBatchSize(args);
   const scoped = { ...args, account: account.id, folder: source.id };
-  const built = await buildMessageQuery(scoped);
-  const first = await messenger.messages.query(built.query);
-  const candidates = await allMessagePages(first, batchSize + 1);
+  const { messages: candidates } = await searchMessages(scoped, batchSize + 1);
   const more = candidates.length > batchSize;
   const messages = more ? candidates.slice(0, batchSize) : candidates;
   return { account, source, scoped, messages, batchSize, more };
@@ -429,7 +443,7 @@ async function executeRequest(request) {
   }
 
   if (op === "compact_folder") {
-    if (!args.confirm) {
+    if (args.confirm !== true) {
       throw new Error("compact_folder requires confirm:true after explicit user approval.");
     }
     const account = await resolveAccount(args);
@@ -456,7 +470,7 @@ async function executeRequest(request) {
   }
 
   if (op === "create_folder") {
-    if (!args.confirm) throw new Error("create_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
+    if (args.confirm !== true) throw new Error("create_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     const account = await resolveAccount(args);
     const name = String(args.name || "").trim();
     if (!name) throw new Error("create_folder wymaga nazwy w polu name.");
@@ -485,7 +499,7 @@ async function executeRequest(request) {
   }
 
   if (op === "rename_folder") {
-    if (!args.confirm) throw new Error("rename_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
+    if (args.confirm !== true) throw new Error("rename_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     const account = await resolveAccount(args);
     const folder = await resolveFolder(account, args.folder);
     const newName = String(args.new_name || args.newName || "").trim();
@@ -515,7 +529,7 @@ async function executeRequest(request) {
   }
 
   if (op === "delete_folder") {
-    if (!args.confirm) throw new Error("delete_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
+    if (args.confirm !== true) throw new Error("delete_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     const account = await resolveAccount(args);
     const folder = await resolveFolder(account, args.folder);
     if (!folder) throw new Error("Nie znaleziono folderu do usunięcia.");
@@ -700,7 +714,7 @@ async function executeRequest(request) {
   }
 
   if (op === "import_msg") {
-    if (!args.confirm) {
+    if (args.confirm !== true) {
       throw new Error("import_msg wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     }
     const transferId = String(args.transfer_id || "").trim();
@@ -743,7 +757,7 @@ async function executeRequest(request) {
     if (!destination) throw new Error(`Nie znaleziono folderu docelowego: ${args.destination}`);
     if (source.id === destination.id) throw new Error("Folder źródłowy i docelowy są takie same.");
 
-    const state = takeBulkState("move", args, account, source);
+    const state = takeBulkState("move", args, account, source, destination);
     const ids = messages.map((message) => message.id);
     if (args.dry_run === true) {
       const continuation = more ? saveBulkState("move", state) : "";
@@ -787,7 +801,7 @@ async function executeRequest(request) {
     const trash = await resolveSpecialFolder(account, "trash", ["trash", "kosz"]);
     if (!trash) throw new Error("Nie znaleziono Kosza na koncie Thunderbird.");
     if (source.id === trash.id) throw new Error("Folder źródłowy jest już Koszem.");
-    const state = takeBulkState("trash", args, account, source);
+    const state = takeBulkState("trash", args, account, source, trash);
     const ids = messages.map((message) => message.id);
     if (args.dry_run === true) {
       const continuation = more ? saveBulkState("trash", state) : "";
@@ -836,7 +850,7 @@ async function executeRequest(request) {
     if (!destination) throw new Error("Nie znaleziono folderu docelowego Inbox/Odebrane.");
     if (destination.id === trash.id) throw new Error("Folder docelowy przywracania nie może być Koszem.");
 
-    const state = takeBulkState("restore", args, account, source);
+    const state = takeBulkState("restore", args, account, source, destination);
     const ids = messages.map((message) => message.id);
     if (args.dry_run === true) {
       const continuation = more ? saveBulkState("restore", state) : "";
@@ -874,7 +888,7 @@ async function executeRequest(request) {
   }
 
   if (op === "empty_trash") {
-    if (!args.confirm) {
+    if (args.confirm !== true) {
       throw new Error("empty_trash wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     }
     const account = await resolveAccount(args);
@@ -897,9 +911,9 @@ async function executeRequest(request) {
       source: plainFolder(trash),
       permanent: true,
       serverOperation: "imap_delete_all_messages",
-      serverVerified: true,
+      serverVerified: remaining.length === 0,
       remainingLocalAfterRefresh: remaining.length,
-      status: "server_empty_trash_completed",
+      status: remaining.length === 0 ? "server_empty_trash_completed" : "verification_failed",
     };
   }
 
@@ -967,18 +981,18 @@ async function executeRequest(request) {
     // be claimed. Local Folders have no server, so verify directly against the
     // local folder instead of trying to run an IMAP operation on it.
     let refreshError = "";
+    let expungeSkipped = false;
     if (isIMAP) {
       try {
-        await messenger.mailbridge.compactAndRefresh(source.accountId, source.path);
+        const measurement = await messenger.mailbridge.compactAndRefresh(source.accountId, source.path);
+        expungeSkipped = measurement?.skipped === true;
       } catch (error) {
         refreshError = String(error?.message || error || "compact/refresh failed");
       }
     }
-    const verifyBuilt = await buildMessageQuery(scoped);
-    const verifyFirst = await messenger.messages.query(verifyBuilt.query);
-    const remainingMessages = await allMessagePages(verifyFirst, Infinity);
+    const { messages: remainingMessages } = await searchMessages(scoped);
     const locallyGone = remainingMessages.length === 0;
-    const verified = locallyGone && (!isIMAP || !refreshError);
+    const verified = locallyGone && (!isIMAP || (!refreshError && !expungeSkipped));
     if (!locallyGone && deleteApiError) {
       throw new Error(`Trwałe usuwanie nie zostało potwierdzone po błędzie API (${deleteApiError}); pozostało ${remainingMessages.length} wiadomości.`);
     }
@@ -993,14 +1007,14 @@ async function executeRequest(request) {
       more: false,
       continuation: "",
       permanent: true,
-      pendingExpunge: false,
+      pendingExpunge: isIMAP && (expungeSkipped || Boolean(refreshError)),
       serverVerified: isIMAP ? verified : false,
       localVerified: !isIMAP ? locallyGone : false,
       deleteApiError: deleteApiError || undefined,
       refreshError: refreshError || undefined,
       status: verified
         ? (deleteApiError ? "verified_deleted_after_api_error" : (isIMAP ? "verified_deleted" : "verified_local_deleted"))
-        : (locallyGone ? "locally_gone_but_server_refresh_failed" : "verification_failed"),
+        : (locallyGone ? (expungeSkipped ? "server_expunge_not_confirmed" : "locally_gone_but_server_refresh_failed") : "verification_failed"),
     };
   }
 
