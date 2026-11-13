@@ -29,6 +29,8 @@ function plainFolder(folder) {
 function plainMessage(message) {
   return {
     id: message.id,
+    headerMessageId: message.headerMessageId || "",
+    size: Number(message.size) || 0,
     author: message.author || "",
     recipients: Array.isArray(message.recipients) ? message.recipients : [],
     ccList: Array.isArray(message.ccList) ? message.ccList : [],
@@ -39,6 +41,46 @@ function plainMessage(message) {
     flagged: Boolean(message.flagged),
     folder: plainFolder(message.folder),
   };
+}
+
+function normalizedHeaderMessageId(message) {
+  return String(message?.headerMessageId || "").trim().replace(/^<|>$/g, "").toLowerCase();
+}
+
+async function folderMessageIdCounts(folder) {
+  const first = await messenger.messages.query({ accountId: folder.accountId, folderId: folder.id });
+  const messages = await allMessagePages(first, Infinity);
+  const counts = new Map();
+  for (const message of messages) {
+    const key = normalizedHeaderMessageId(message);
+    if (key) counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return counts;
+}
+
+async function sourceMessagesGone(ids, sourceId) {
+  const checks = await Promise.all(ids.map(async id => {
+    try {
+      const message = await messenger.messages.get(id);
+      return message?.folder?.id !== sourceId;
+    } catch (_) {
+      return true;
+    }
+  }));
+  return checks.every(Boolean);
+}
+
+function isGmailAllMailFolder(account, folder) {
+  if (String(account?.type || "").toLowerCase() !== "imap") return false;
+  const specialUse = Array.isArray(folder?.specialUse) ? folder.specialUse.map(value => String(value).toLowerCase()) : [];
+  const path = String(folder?.path || "").toLowerCase();
+  return specialUse.includes("archives") && (path.includes("[gmail]") || String(account?.name || "").toLowerCase().includes("gmail"));
+}
+
+function trashCountsMeetRequired(actualCounts, requiredCounts) {
+  return [...requiredCounts].every(([key, count]) =>
+    (actualCounts.get(key) || 0) >= count
+  );
 }
 
 function plainAttachment(attachment) {
@@ -250,10 +292,12 @@ async function buildMessageQuery(args = {}) {
   const to = String(args.to || args.recipient || "").trim();
   const subject = String(args.subject || "").trim();
   const fullText = String(args.fullText || args.text || "").trim();
+  const headerMessageId = String(args.header_message_id || args.headerMessageId || "").trim().replace(/^<|>$/g, "");
   if (from) query.author = from;
   if (to) query.recipients = to;
   if (subject) query.subject = subject;
   if (fullText) query.fullText = fullText;
+  if (headerMessageId) query.headerMessageId = headerMessageId;
   if (args.since) query.fromDate = new Date(`${args.since}T00:00:00`);
   if (args.until) query.toDate = new Date(`${args.until}T23:59:59`);
   return { account, query, folder, scope };
@@ -295,9 +339,33 @@ function hasMutationFilter(args = {}) {
     String(args.from || args.author || "").trim() ||
     String(args.subject || "").trim() ||
     String(args.fullText || args.text || "").trim() ||
+    String(args.header_message_id || args.headerMessageId || "").trim() ||
+    normalizedRequestedHeaderMessageIds(args).length > 0 ||
+    normalizedRequestedMessageIds(args).length > 0 ||
     String(args.since || "").trim() ||
     String(args.until || "").trim()
   );
+}
+
+function normalizedRequestedMessageIds(args = {}) {
+  const raw = [
+    ...(Array.isArray(args.message_ids) ? args.message_ids : []),
+    ...(Array.isArray(args.messageIds) ? args.messageIds : []),
+  ];
+  return [...new Set(raw
+    .map(value => Number(value))
+    .filter(value => Number.isSafeInteger(value) && value > 0))];
+}
+
+function normalizedRequestedHeaderMessageIds(args = {}) {
+  const raw = [
+    args.header_message_id || args.headerMessageId || "",
+    ...(Array.isArray(args.header_message_ids) ? args.header_message_ids : []),
+    ...(Array.isArray(args.headerMessageIds) ? args.headerMessageIds : []),
+  ];
+  return [...new Set(raw
+    .map(value => String(value || "").trim().replace(/^<|>$/g, "").toLowerCase())
+    .filter(Boolean))];
 }
 
 async function resolveSpecialFolder(account, specialUse, fallbackNames = []) {
@@ -339,6 +407,9 @@ function mutationFingerprint(op, account, source, args = {}) {
     from: String(args.from || args.author || "").trim().toLowerCase(),
     subject: String(args.subject || "").trim().toLowerCase(),
     text: String(args.fullText || args.text || "").trim().toLowerCase(),
+    headerMessageId: String(args.header_message_id || args.headerMessageId || "").trim().replace(/^<|>$/g, "").toLowerCase(),
+    headerMessageIds: normalizedRequestedHeaderMessageIds(args).sort(),
+    messageIds: normalizedRequestedMessageIds(args).sort((a, b) => a - b),
     since: String(args.since || "").trim(),
     until: String(args.until || "").trim(),
     destination: String(args.destination || "").trim().toLowerCase(),
@@ -382,6 +453,56 @@ async function mutationMessages(args = {}, defaultFolder = "inbox", allowWholeFo
   if (!source) throw new Error(`Nie znaleziono folderu źródłowego (${defaultFolder}).`);
   const batchSize = mutationBatchSize(args);
   const scoped = { ...args, account: account.id, folder: source.id };
+  const requestedMessageIds = normalizedRequestedMessageIds(args);
+  if (requestedMessageIds.length > 100) {
+    throw new Error("Jedna operacja może wskazywać najwyżej 100 dokładnych identyfikatorów wiadomości Thunderbird.");
+  }
+  if (requestedMessageIds.length > 0) {
+    const messages = [];
+    for (const id of requestedMessageIds) {
+      let message;
+      try { message = await messenger.messages.get(id); } catch (_) { message = null; }
+      if (!message || message.folder?.id !== source.id) {
+        throw new Error(`Wiadomość Thunderbird ${id} nie istnieje już w wybranym folderze. Przerwano bez zmian.`);
+      }
+      messages.push(message);
+    }
+    return { account, source, scoped, messages, batchSize: messages.length, more: false };
+  }
+  const requestedHeaderMessageIds = normalizedRequestedHeaderMessageIds(args);
+  if (requestedHeaderMessageIds.length > 100) {
+    throw new Error("Jedna operacja może wskazywać najwyżej 100 dokładnych Message-ID.");
+  }
+  if (requestedHeaderMessageIds.length > 1 || Array.isArray(args.header_message_ids) || Array.isArray(args.headerMessageIds)) {
+    const requestedSet = new Set(requestedHeaderMessageIds);
+    const byId = new Map();
+    // One local header scan is both faster and more reliable than issuing up
+    // to 100 rapid Thunderbird queries. Some providers/Thunderbird versions
+    // intermittently omit exact Message-ID query results containing '+' or
+    // other punctuation when many queries are executed back-to-back.
+    const built = await buildMessageQuery({
+      ...scoped,
+      header_message_id: "",
+      headerMessageId: "",
+      header_message_ids: undefined,
+      headerMessageIds: undefined,
+    });
+    const first = await messenger.messages.query(built.query);
+    const candidates = await allMessagePages(first, Infinity);
+    for (const message of candidates) {
+      if (requestedSet.has(normalizedHeaderMessageId(message))) byId.set(message.id, message);
+    }
+    const messages = [...byId.values()];
+    const foundHeaderMessageIds = new Set(messages.map(normalizedHeaderMessageId));
+    const missing = requestedHeaderMessageIds.filter(id => !foundHeaderMessageIds.has(id));
+    if (missing.length > 0) {
+      throw new Error(
+        `Nie znaleziono ${missing.length} z ${requestedHeaderMessageIds.length} dokładnie wskazanych wiadomości ` +
+        `(${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", ..." : ""}). Przerwano bez zmian.`
+      );
+    }
+    return { account, source, scoped, messages, batchSize: messages.length, more: false };
+  }
   const built = await buildMessageQuery(scoped);
   const first = await messenger.messages.query(built.query);
   const candidates = await allMessagePages(first, batchSize + 1);
@@ -588,6 +709,27 @@ async function executeRequest(request) {
     };
   }
 
+  if (op === "largest") {
+    const { account, query, folder, scope } = await buildMessageQuery(args);
+    const first = await messenger.messages.query(query);
+    const messages = await allMessagePages(first, Infinity);
+    const limit = Math.max(1, Math.min(Number(args.limit) || 40, 100));
+    const totalBytes = messages.reduce((sum, message) => sum + (Number(message.size) || 0), 0);
+    const largest = messages
+      .slice()
+      .sort((a, b) => (Number(b.size) || 0) - (Number(a.size) || 0) || Number(b.id) - Number(a.id))
+      .slice(0, limit)
+      .map(plainMessage);
+    return {
+      account: { id: account.id, name: account.name, type: account.type },
+      folder: plainFolder(folder),
+      scope,
+      totalMessages: messages.length,
+      totalBytes,
+      largest,
+    };
+  }
+
   if (op === "count" || op === "search") {
     const max = op === "search" ? Math.max(1, Math.min(Number(args.limit) || 20, 100)) : Infinity;
     const { account, folder, scope, messages } = await searchMessages(args, max);
@@ -743,6 +885,13 @@ async function executeRequest(request) {
     if (!destination) throw new Error(`Nie znaleziono folderu docelowego: ${args.destination}`);
     if (source.id === destination.id) throw new Error("Folder źródłowy i docelowy są takie same.");
 
+    if (isGmailAllMailFolder(account, source)) {
+      throw new Error(
+        "Operacja move z Gmail All Mail/Wszystkie jest zablokowana: stary mechanizm IMAP może potraktować przeniesienie jak trwałe usunięcie. " +
+        "Użyj zwykłego folderu/etykiety albo bezpiecznej kopii lokalnej; wiadomości źródłowe pozostawiono bez zmian."
+      );
+    }
+
     const state = takeBulkState("move", args, account, source);
     const ids = messages.map((message) => message.id);
     if (args.dry_run === true) {
@@ -782,13 +931,115 @@ async function executeRequest(request) {
     };
   }
 
+  if (op === "copy") {
+    if (!String(args.destination || "").trim()) {
+      throw new Error("Kopiowanie wymaga folderu docelowego w polu destination.");
+    }
+    const { account, source, messages, batchSize, more } = await mutationMessages(args, "inbox");
+    const destinationAccount = await resolveAccount({ account: args.destination_account || args.destinationAccount || account.id });
+    const destination = await resolveFolder(destinationAccount, args.destination);
+    if (!destination) throw new Error(`Nie znaleziono folderu docelowego: ${args.destination}`);
+    if (source.id === destination.id) throw new Error("Folder źródłowy i docelowy są takie same.");
+    if (isGmailAllMailFolder(account, source) && destinationAccount.id === account.id) {
+      throw new Error(
+        "Kopiowanie z Gmail All Mail/Wszystkie do tego samego konta jest zablokowane: stary IMAP moĹĽe tworzyÄ‡ duplikaty i dĹ‚ugo czekaÄ‡ na synchronizacjÄ™. " +
+        "Kopiuj z All Mail wyĹ‚Ä…cznie do Local Folders albo uĹĽyj zwykĹ‚ej etykiety w Gmailu."
+      );
+    }
+    const ids = messages.map(message => message.id);
+    const expected = messages.map(message => ({
+      headerMessageId: String(message.headerMessageId || "").trim().replace(/^<|>$/g, "").toLowerCase(),
+      size: Number(message.size) || 0,
+    }));
+    if (expected.some(item => !item.headerMessageId)) {
+      throw new Error("Kopiowanie z weryfikacją wymaga nagłówka Message-ID w każdej wiadomości.");
+    }
+    const beforeFirst = await messenger.messages.query({ accountId: destination.accountId, folderId: destination.id });
+    const beforeMessages = await allMessagePages(beforeFirst, Infinity);
+    const beforeCounts = new Map();
+    for (const message of beforeMessages) {
+      const key = String(message.headerMessageId || "").trim().replace(/^<|>$/g, "").toLowerCase();
+      if (key) beforeCounts.set(key, (beforeCounts.get(key) || 0) + 1);
+    }
+    const missingIndexes = expected
+      .map((item, index) => beforeCounts.has(item.headerMessageId) ? -1 : index)
+      .filter(index => index >= 0);
+    const missingIds = missingIndexes.map(index => ids[index]);
+    const missingExpected = missingIndexes.map(index => expected[index]);
+    await inChunks(missingIds, 100, async chunk => {
+      await messenger.messages.copy(chunk, destination.id, { isUserAction: true });
+    });
+    let verified = false;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const afterFirst = await messenger.messages.query({ accountId: destination.accountId, folderId: destination.id });
+      const afterMessages = await allMessagePages(afterFirst, Infinity);
+      const afterCounts = new Map();
+      for (const message of afterMessages) {
+        const key = String(message.headerMessageId || "").trim().replace(/^<|>$/g, "").toLowerCase();
+        if (key) afterCounts.set(key, (afterCounts.get(key) || 0) + 1);
+      }
+      verified = expected.every(item =>
+        beforeCounts.has(item.headerMessageId) ||
+        (afterCounts.get(item.headerMessageId) || 0) > (beforeCounts.get(item.headerMessageId) || 0)
+      );
+      if (verified) break;
+      await sleep(250);
+    }
+    return {
+      account: { id: account.id, name: account.name, type: account.type },
+      source: plainFolder(source),
+      destinationAccount: { id: destinationAccount.id, name: destinationAccount.name, type: destinationAccount.type },
+      destination: plainFolder(destination),
+      batchSize,
+      copied: missingIds.length,
+      skipped: ids.length - missingIds.length,
+      copiedBytes: missingExpected.reduce((sum, item) => sum + item.size, 0),
+      more,
+      verified,
+      messageIds: expected.map(item => item.headerMessageId),
+      permanent: false,
+    };
+  }
+
   if (op === "trash") {
     const { account, source, messages, batchSize, more } = await mutationMessages(args, "inbox");
     const trash = await resolveSpecialFolder(account, "trash", ["trash", "kosz"]);
     if (!trash) throw new Error("Nie znaleziono Kosza na koncie Thunderbird.");
     if (source.id === trash.id) throw new Error("Folder źródłowy jest już Koszem.");
+    const requestedHeaderMessageIds = normalizedRequestedHeaderMessageIds(args);
+    const requestedMessageIds = normalizedRequestedMessageIds(args);
+    const hasOnlyExactMessageIds = (requestedHeaderMessageIds.length > 0 || requestedMessageIds.length > 0) && !(
+      String(args.from || args.author || "").trim() ||
+      String(args.subject || "").trim() ||
+      String(args.fullText || args.text || "").trim() ||
+      String(args.since || "").trim() ||
+      String(args.until || "").trim()
+    );
+    const verifiedLocalBackupOverride = args.local_backup_verified === true && hasOnlyExactMessageIds;
+    if (isGmailAllMailFolder(account, source) && !verifiedLocalBackupOverride) {
+      throw new Error(
+        "Operacja trash z Gmail All Mail/Wszystkie jest zablokowana: Gmail może po synchronizacji trwale usunąć wiadomość razem z kopią Kosza. " +
+        "Użyj zwykłego folderu/etykiety albo osobnego, jawnie zatwierdzonego procesu: kopia lokalna, weryfikacja i trwałe usunięcie."
+      );
+    }
+    if (isGmailAllMailFolder(account, source)) {
+      const actualHeaderMessageIds = new Set(messages.map(normalizedHeaderMessageId));
+      const missing = requestedHeaderMessageIds.filter(id => !actualHeaderMessageIds.has(id));
+      const expectedCount = requestedMessageIds.length || requestedHeaderMessageIds.length;
+      if (missing.length > 0 || messages.length !== expectedCount) {
+        throw new Error("Jawnie zatwierdzone usuwanie z Gmail All Mail wymaga dokładnie jednej znalezionej wiadomości dla każdego Message-ID. Przerwano bez zmian.");
+      }
+    }
     const state = takeBulkState("trash", args, account, source);
     const ids = messages.map((message) => message.id);
+    const expectedCounts = new Map();
+    for (const message of messages) {
+      const key = normalizedHeaderMessageId(message);
+      if (!key) {
+        throw new Error("Bezpieczne przeniesienie do Kosza wymaga nagłówka Message-ID w każdej wiadomości.");
+      }
+      expectedCounts.set(key, (expectedCounts.get(key) || 0) + 1);
+    }
     if (args.dry_run === true) {
       const continuation = more ? saveBulkState("trash", state) : "";
       return {
@@ -804,9 +1055,82 @@ async function executeRequest(request) {
         dryRun: true,
       };
     }
-    await inChunks(ids, 100, async (chunk) => {
-      await messenger.messages.move(chunk, trash.id, { isUserAction: true });
-    });
+    const beforeTrashCounts = await folderMessageIdCounts(trash);
+    const gmailAllMailSafetyCopy = isGmailAllMailFolder(account, source);
+    const requiredTrashCounts = new Map();
+    let deletionMethod = "messages.delete(deletePermanently:false)";
+    if (gmailAllMailSafetyCopy) {
+      // Gmail's All Mail is a virtual system label, not a normal IMAP folder.
+      // Moving/deleting directly from it can be expunged permanently after the
+      // first optimistic local update. Stage an independent server copy in
+      // Trash first, verify it, then remove only the original message ids.
+      const alreadyStaged = [...expectedCounts].every(([key, count]) =>
+        (beforeTrashCounts.get(key) || 0) >= count
+      );
+      if (alreadyStaged) {
+        for (const [key, count] of expectedCounts) {
+          requiredTrashCounts.set(key, Math.max(count, beforeTrashCounts.get(key) || 0));
+        }
+        deletionMethod = "gmail-resume-existing-trash-copy-then-delete-original";
+      } else {
+        await inChunks(ids, 100, async chunk => {
+          await messenger.messages.copy(chunk, trash.id, { isUserAction: true });
+        });
+        for (const [key, count] of expectedCounts) {
+          requiredTrashCounts.set(key, (beforeTrashCounts.get(key) || 0) + count);
+        }
+        deletionMethod = "gmail-trash-copy-then-delete-original";
+      }
+      let staged = alreadyStaged;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const stagedCounts = await folderMessageIdCounts(trash);
+        staged = trashCountsMeetRequired(stagedCounts, requiredTrashCounts);
+        if (staged) break;
+        await sleep(500);
+      }
+      if (!staged) {
+        throw new Error("Gmail nie potwierdził kopii bezpieczeństwa w Koszu; wiadomości źródłowe pozostawiono bez zmian.");
+      }
+      if (!(await sourceMessagesGone(ids, source.id))) {
+        await inChunks(ids, 100, async chunk => {
+          await messenger.messages.delete(chunk, { deletePermanently: true, isUserAction: true });
+        });
+      }
+    } else {
+      for (const [key, count] of expectedCounts) {
+        requiredTrashCounts.set(key, (beforeTrashCounts.get(key) || 0) + count);
+      }
+      await inChunks(ids, 100, async chunk => {
+        await messenger.messages.delete(chunk, { deletePermanently: false, isUserAction: true });
+      });
+    }
+    let trashVerified = ids.length === 0;
+    let sourceVerified = ids.length === 0;
+    for (let attempt = 0; attempt < 30 && !(trashVerified && sourceVerified); attempt++) {
+      const afterTrashCounts = await folderMessageIdCounts(trash);
+      trashVerified = trashCountsMeetRequired(afterTrashCounts, requiredTrashCounts);
+      sourceVerified = await sourceMessagesGone(ids, source.id);
+      if (!(trashVerified && sourceVerified)) await sleep(500);
+    }
+    if (!(trashVerified && sourceVerified)) {
+      throw new Error(
+        `Przeniesienie do Kosza nie przeszło weryfikacji (trashVerified=${trashVerified}, sourceVerified=${sourceVerified}). ` +
+        "Nie ponawiaj operacji w ciemno; najpierw sprawdź folder źródłowy i Kosz."
+      );
+    }
+    // IMAP/Gmail may first expose an optimistic local move and only later
+    // apply server EXPUNGE semantics. Require the result to survive a settle
+    // window before reporting a recoverable Trash operation as successful.
+    await sleep(5000);
+    const settledTrashCounts = await folderMessageIdCounts(trash);
+    trashVerified = trashCountsMeetRequired(settledTrashCounts, requiredTrashCounts);
+    sourceVerified = await sourceMessagesGone(ids, source.id);
+    if (!(trashVerified && sourceVerified)) {
+      throw new Error(
+        `Kosz nie zachował wiadomości po synchronizacji (trashVerified=${trashVerified}, sourceVerified=${sourceVerified}). ` +
+        "Operacja nie jest potwierdzona jako odwracalna. Nie kontynuuj kolejnej partii."
+      );
+    }
     state.processed += ids.length;
     const continuation = more ? saveBulkState("trash", state) : "";
     return {
@@ -820,6 +1144,11 @@ async function executeRequest(request) {
       more,
       continuation,
       permanent: false,
+      trashVerified,
+      sourceVerified,
+      serverVerified: String(account.type || "").toLowerCase() === "imap",
+      localVerified: String(account.type || "").toLowerCase() !== "imap",
+      deletionMethod,
     };
   }
 
