@@ -91,6 +91,9 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `read`
 - `attachments`
 - `get_attachment`
+- `address_books`
+- `contacts`
+- `contact_candidates`
 
 ### Mutating operations
 
@@ -98,6 +101,9 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `rename_folder`
 - `delete_folder`
 - `compact_folder`
+- `create_address_book`
+- `add_contacts`
+- `update_contact`
 - `import_msg`
 - `move`
 - `trash`
@@ -107,6 +113,12 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `delete_permanently`
 
 Mutating operations that can change or destroy user data require `confirm: true` where enforced by the extension.
+
+### Address books and contacts
+
+`address_books` and `contacts` inspect Thunderbird's current address books. `contact_candidates` scans only message headers and aggregates sender/recipient addresses, excluding the selected mailbox owner's own address.
+
+`create_address_book` creates a separate local book after `confirm:true`. `add_contacts` accepts up to 200 explicit `{name,email}` objects after `confirm:true`, skips invalid addresses and deduplicates email addresses within the selected destination book. This keeps retries safe while allowing a dedicated book to contain an address already present elsewhere. `update_contact` corrects the name or email of an exact `contact_id` after `confirm:true`. Hosts should filter automated, newsletter, store and `noreply` candidates before import.
 
 ## Common search arguments
 

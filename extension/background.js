@@ -517,6 +517,143 @@ async function inChunks(items, size, fn) {
   }
 }
 
+function parseMailbox(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const emailMatch = raw.match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  if (!emailMatch) return null;
+  const email = emailMatch[0].toLowerCase();
+  let name = raw.replace(emailMatch[0], "").replace(/[<>]/g, "").trim();
+  name = name.replace(/^["']+|["']+$/g, "").trim();
+  if (!name || name.toLowerCase() === email) name = email.split("@", 1)[0];
+  return { email, name };
+}
+
+function contactNodeDetails(contact) {
+  const properties = contact?.properties || {};
+  let email = String(properties.PrimaryEmail || "").trim().toLowerCase();
+  let name = String(properties.DisplayName || "").trim();
+  const vCard = String(properties.vCard || "");
+  if (!email) {
+    const match = vCard.match(/^EMAIL(?:;[^:]*)?:(.+)$/im);
+    if (match) email = match[1].trim().toLowerCase();
+  }
+  if (!name) {
+    const match = vCard.match(/^FN(?:;[^:]*)?:(.+)$/im);
+    if (match) name = match[1].trim();
+  }
+  return {
+    id: contact?.id || "",
+    parentId: contact?.parentId || "",
+    name,
+    email,
+    readOnly: Boolean(contact?.readOnly),
+    remote: Boolean(contact?.remote),
+  };
+}
+
+function plainAddressBook(book) {
+  return {
+    id: book?.id || "",
+    name: book?.name || "",
+    readOnly: Boolean(book?.readOnly),
+    remote: Boolean(book?.remote),
+    contactCount: Array.isArray(book?.contacts) ? book.contacts.length : null,
+  };
+}
+
+async function resolveAddressBook(raw, requireWritable = true) {
+  const books = await messenger.addressBooks.list(true);
+  const wanted = String(raw || "").trim().toLowerCase();
+  let book = wanted
+    ? books.find(item => String(item.id || "").toLowerCase() === wanted || String(item.name || "").toLowerCase() === wanted)
+    : books.find(item => !item.readOnly && !item.remote);
+  if (!book) throw new Error(wanted ? `Nie znaleziono ksiÄ…ĹĽki adresowej: ${raw}` : "Nie znaleziono lokalnej ksiÄ…ĹĽki adresowej.");
+  if (requireWritable && (book.readOnly || book.remote)) throw new Error("Wybrana ksiÄ…ĹĽka adresowa jest tylko do odczytu.");
+  return book;
+}
+
+function escapeVCardText(value) {
+  return String(value || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\\/g, "\\\\")
+    .replace(/;/g, "\\;")
+    .replace(/,/g, "\\,")
+    .trim();
+}
+
+function contactVCard(name, email) {
+  return [
+    "BEGIN:VCARD",
+    "VERSION:4.0",
+    `FN:${escapeVCardText(name)}`,
+    `EMAIL;PREF=1:${email}`,
+    "END:VCARD",
+    "",
+  ].join("\r\n");
+}
+
+async function contactCandidates(args = {}) {
+  const { account, query, folder, scope } = await buildMessageQuery(args);
+  const first = await messenger.messages.query(query);
+  const messages = await allMessagePages(first, Infinity);
+  const ownEmails = new Set();
+  const accounts = await messenger.accounts.list();
+  for (const item of accounts) {
+    const fromName = parseMailbox(item.name);
+    if (fromName) ownEmails.add(fromName.email);
+    for (const identity of item.identities || []) {
+      const email = String(identity.email || "").trim().toLowerCase();
+      if (email) ownEmails.add(email);
+    }
+  }
+  for (const value of args.exclude_emails || args.excludeEmails || []) {
+    const parsed = parseMailbox(value);
+    if (parsed) ownEmails.add(parsed.email);
+  }
+
+  const grouped = new Map();
+  const add = (value, role, seen) => {
+    const parsed = parseMailbox(value);
+    if (!parsed || ownEmails.has(parsed.email) || seen.has(parsed.email)) return;
+    seen.add(parsed.email);
+    let item = grouped.get(parsed.email);
+    if (!item) {
+      item = { email: parsed.email, name: parsed.name, messages: 0, senderMessages: 0, recipientMessages: 0 };
+      grouped.set(parsed.email, item);
+    }
+    const fallback = item.email.split("@", 1)[0];
+    if (item.name === fallback && parsed.name !== fallback) item.name = parsed.name;
+    item.messages++;
+    if (role === "sender") item.senderMessages++;
+    else item.recipientMessages++;
+  };
+
+  for (const message of messages) {
+    const senderSeen = new Set();
+    const recipientSeen = new Set();
+    add(message.author, "sender", senderSeen);
+    for (const value of [...(message.recipients || []), ...(message.ccList || [])]) {
+      add(value, "recipient", recipientSeen);
+    }
+  }
+  const minCount = Math.max(1, Number(args.min_count ?? args.minCount) || 1);
+  const limit = Math.max(1, Math.min(Number(args.limit) || 200, 500));
+  const candidates = [...grouped.values()]
+    .filter(item => item.messages >= minCount)
+    .sort((a, b) => b.messages - a.messages || a.email.localeCompare(b.email))
+    .slice(0, limit);
+  return {
+    account: { id: account.id, name: account.name, type: account.type },
+    folder: plainFolder(folder),
+    scope,
+    scannedMessages: messages.length,
+    candidateCount: grouped.size,
+    returned: candidates.length,
+    candidates,
+  };
+}
+
 async function executeRequest(request) {
   const op = String(request.op || "").toLowerCase();
   const args = request.args || {};
@@ -531,6 +668,7 @@ async function executeRequest(request) {
       attachmentMetadataAvailable: Boolean(messenger.messages && messenger.messages.listAttachments),
       attachmentContentAvailable: Boolean(messenger.messages && messenger.messages.getAttachmentFile),
       messageBodyAvailable: Boolean(messenger.messages && (messenger.messages.listInlineTextParts || messenger.messages.getFull)),
+      addressBookAvailable: Boolean(messenger.addressBooks && messenger.contacts),
       accounts: accounts.map((account) => ({ id: account.id, name: account.name, type: account.type })),
     };
   }
@@ -538,6 +676,109 @@ async function executeRequest(request) {
   if (op === "accounts") {
     const accounts = await messenger.accounts.list();
     return accounts.map((account) => ({ id: account.id, name: account.name, type: account.type }));
+  }
+
+  if (op === "address_books") {
+    const books = await messenger.addressBooks.list(true);
+    return { addressBooks: books.map(plainAddressBook) };
+  }
+
+  if (op === "contacts") {
+    const selector = String(args.address_book || args.addressBook || "").trim();
+    const books = selector
+      ? [await resolveAddressBook(selector, false)]
+      : await messenger.addressBooks.list(true);
+    const contacts = [];
+    for (const book of books) {
+      const listed = Array.isArray(book.contacts) ? book.contacts : await messenger.contacts.list(book.id);
+      for (const contact of listed) contacts.push({ ...contactNodeDetails(contact), addressBook: book.name });
+    }
+    return { count: contacts.length, contacts };
+  }
+
+  if (op === "contact_candidates") {
+    return contactCandidates(args);
+  }
+
+  if (op === "create_address_book") {
+    if (!args.confirm) throw new Error("create_address_book wymaga confirm:true po wyraĹşnej zgodzie uĹĽytkownika.");
+    const name = String(args.name || "").trim();
+    if (!name) throw new Error("create_address_book wymaga name.");
+    const books = await messenger.addressBooks.list(true);
+    const existing = books.find(book => String(book.name || "").trim().toLowerCase() === name.toLowerCase());
+    if (existing) return { created: false, addressBook: plainAddressBook(existing) };
+    const id = await messenger.addressBooks.create({ name });
+    const created = await messenger.addressBooks.get(id, true);
+    return { created: true, addressBook: plainAddressBook(created) };
+  }
+
+  if (op === "add_contacts") {
+    if (!args.confirm) throw new Error("add_contacts wymaga confirm:true po wyraĹşnej zgodzie uĹĽytkownika.");
+    const requested = Array.isArray(args.contacts) ? args.contacts : [];
+    if (!requested.length) throw new Error("add_contacts wymaga niepustej listy contacts.");
+    if (requested.length > 200) throw new Error("Jedna operacja moĹĽe dodaÄ‡ najwyĹĽej 200 kontaktĂłw.");
+    const book = await resolveAddressBook(args.address_book || args.addressBook, true);
+    const existingEmails = new Set();
+    const listed = Array.isArray(book.contacts) ? book.contacts : await messenger.contacts.list(book.id);
+    for (const contact of listed) {
+      const details = contactNodeDetails(contact);
+      if (details.email) existingEmails.add(details.email);
+    }
+    const seen = new Set();
+    const created = [];
+    const skipped = [];
+    for (const input of requested) {
+      const parsed = parseMailbox(input?.email);
+      if (!parsed) {
+        skipped.push({ email: String(input?.email || ""), reason: "invalid_email" });
+        continue;
+      }
+      if (existingEmails.has(parsed.email) || seen.has(parsed.email)) {
+        skipped.push({ email: parsed.email, reason: "already_exists" });
+        continue;
+      }
+      seen.add(parsed.email);
+      const name = String(input?.name || "").trim() || parsed.name;
+      const id = await messenger.contacts.create(book.id, { vCard: contactVCard(name, parsed.email) });
+      existingEmails.add(parsed.email);
+      created.push({ id, name, email: parsed.email });
+    }
+    return {
+      addressBook: plainAddressBook(book),
+      requested: requested.length,
+      createdCount: created.length,
+      skippedCount: skipped.length,
+      created,
+      skipped,
+    };
+  }
+
+  if (op === "update_contact") {
+    if (!args.confirm) throw new Error("update_contact wymaga confirm:true po wyraźnej zgodzie użytkownika.");
+    const contactId = String(args.contact_id || args.contactId || "").trim();
+    if (!contactId) throw new Error("update_contact wymaga contact_id.");
+    const books = await messenger.addressBooks.list(true);
+    let current = null;
+    let parentBook = null;
+    for (const book of books) {
+      const listed = Array.isArray(book.contacts) ? book.contacts : await messenger.contacts.list(book.id);
+      const found = listed.find(contact => String(contact.id) === contactId);
+      if (found) {
+        current = contactNodeDetails(found);
+        parentBook = book;
+        break;
+      }
+    }
+    if (!current || !parentBook) throw new Error(`Nie znaleziono kontaktu: ${contactId}`);
+    if (parentBook.readOnly) throw new Error(`Książka adresowa jest tylko do odczytu: ${parentBook.name}`);
+    const parsed = parseMailbox(args.email || current.email);
+    if (!parsed) throw new Error("update_contact wymaga prawidłowego obecnego lub nowego adresu email.");
+    const name = String(args.name || "").trim() || current.name || parsed.name;
+    await messenger.contacts.update(contactId, { vCard: contactVCard(name, parsed.email) });
+    return {
+      updated: true,
+      contact: { id: contactId, addressBook: parentBook.name, name, email: parsed.email },
+    };
   }
 
   if (op === "folders") {

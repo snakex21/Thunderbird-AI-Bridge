@@ -16,6 +16,7 @@
     "messagesImport",
     "messagesMove",
     "messagesDelete",
+    "addressBooks",
     "http://127.0.0.1:47831/*"
   ],
   "background": {
