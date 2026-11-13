@@ -227,11 +227,12 @@ async function readMessageBody(messageId) {
   };
 }
 
-async function allMessagePages(first, max = Infinity) {
+async function allMessagePages(first, max = Infinity, predicate = null) {
   const messages = [];
   let page = first;
   while (page) {
     for (const message of page.messages || []) {
+      if (predicate && !predicate(message)) continue;
       messages.push(message);
       if (messages.length >= max) {
         if (page.id) {
@@ -297,25 +298,91 @@ async function buildMessageQuery(args = {}) {
   }
   const from = String(args.from || args.author || "").trim();
   const to = String(args.to || args.recipient || "").trim();
+  const address = String(args.address || "").trim();
   const subject = String(args.subject || "").trim();
   const fullText = String(args.fullText || args.text || "").trim();
   const headerMessageId = String(args.header_message_id || args.headerMessageId || "").trim().replace(/^<|>$/g, "");
-  if (from) query.author = from;
-  if (to) query.recipients = to;
+  // Thunderbird's author/recipients query requires a full address or a name,
+  // so a bare domain ("example.com" / "@example.com") would match nothing.
+  // Domain filters are applied locally to the parsed mailbox instead.
+  const filters = [];
+  const addressDomain = domainFilterSpec(address);
+  if (addressDomain) {
+    filters.push(message => mailboxesMatchDomain([message.author, ...messageRecipientValues(message)], addressDomain));
+  } else {
+    const fromDomain = domainFilterSpec(from);
+    const toDomain = domainFilterSpec(to);
+    if (fromDomain) filters.push(message => mailboxesMatchDomain([message.author], fromDomain));
+    else if (from) query.author = from;
+    if (toDomain) filters.push(message => mailboxesMatchDomain(messageRecipientValues(message), toDomain));
+    else if (to) query.recipients = to;
+  }
   if (subject) query.subject = subject;
   if (fullText) query.fullText = fullText;
   if (headerMessageId) query.headerMessageId = headerMessageId;
   if (args.since) query.fromDate = new Date(`${args.since}T00:00:00`);
   if (args.until) query.toDate = new Date(`${args.until}T23:59:59`);
-  return { account, query, folder, scope };
+  const filter = filters.length ? message => filters.every(fn => fn(message)) : null;
+  return { account, query, folder, scope, filter };
 }
 
-async function searchMessages(args = {}, max = Infinity) {
-  const address = String(args.address || "").trim();
-  if (!address) {
-    const built = await buildMessageQuery(args);
+const DOMAIN_PATTERN = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:[a-z]{2,}|xn--[a-z0-9-]+)$/i;
+
+// Returns {domain, strict} for "@example.com" (strict: domain only) or a bare
+// "example.com" (also matches a display name containing that text, so dotted
+// names keep working), otherwise null for full addresses and plain names.
+function domainFilterSpec(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (!value) return null;
+  if (value.startsWith("@")) {
+    const domain = value.slice(1);
+    return DOMAIN_PATTERN.test(domain) ? { domain, strict: true } : null;
+  }
+  if (value.includes("@") || /[\s<>",;]/.test(value)) return null;
+  return DOMAIN_PATTERN.test(value) ? { domain: value, strict: false } : null;
+}
+
+function messageRecipientValues(message) {
+  return [
+    ...(Array.isArray(message?.recipients) ? message.recipients : []),
+    ...(Array.isArray(message?.ccList) ? message.ccList : []),
+  ];
+}
+
+function mailboxesMatchDomain(values, spec) {
+  return values.some(value => {
+    const parsed = parseMailbox(value);
+    if (parsed) {
+      const domain = parsed.email.slice(parsed.email.lastIndexOf("@") + 1);
+      if (domain === spec.domain || domain.endsWith(`.${spec.domain}`)) return true;
+      return !spec.strict && parsed.name.toLowerCase().includes(spec.domain);
+    }
+    return !spec.strict && String(value || "").toLowerCase().includes(spec.domain);
+  });
+}
+
+function sortNewestFirst(messages) {
+  return messages.sort((a, b) =>
+    (new Date(b.date || 0) - new Date(a.date || 0)) || (Number(b.id) || 0) - (Number(a.id) || 0)
+  );
+}
+
+// Search results are always returned newest-first (date desc, then id desc).
+// Thunderbird returns query pages in folder order, so a limited newest-first
+// search has to scan all matching headers before slicing. Mutation selection
+// passes newestFirst:false to keep its early stop after batch_size + 1.
+async function searchMessages(args = {}, max = Infinity, options = {}) {
+  const newestFirst = options.newestFirst !== false;
+  const limit = Number.isFinite(max) ? max : undefined;
+  const collect = async built => {
     const first = await messenger.messages.query(built.query);
-    return { ...built, messages: await allMessagePages(first, max) };
+    return allMessagePages(first, newestFirst ? Infinity : max, built.filter);
+  };
+  const address = String(args.address || "").trim();
+  if (!address || domainFilterSpec(address)) {
+    const built = await buildMessageQuery(args);
+    const messages = await collect(built);
+    return { ...built, messages: newestFirst ? sortNewestFirst(messages).slice(0, limit) : messages };
   }
 
   // Thunderbird exposes sender and To-recipient as separate query fields.
@@ -325,19 +392,10 @@ async function searchMessages(args = {}, max = Infinity) {
   const recipientArgs = { ...args, address: "", from: "", author: "", to: address, recipient: "" };
   const senderBuilt = await buildMessageQuery(senderArgs);
   const recipientBuilt = await buildMessageQuery(recipientArgs);
-  const [senderFirst, recipientFirst] = await Promise.all([
-    messenger.messages.query(senderBuilt.query),
-    messenger.messages.query(recipientBuilt.query),
-  ]);
-  const [senderMessages, recipientMessages] = await Promise.all([
-    allMessagePages(senderFirst, max),
-    allMessagePages(recipientFirst, max),
-  ]);
+  const [senderMessages, recipientMessages] = await Promise.all([collect(senderBuilt), collect(recipientBuilt)]);
   const byId = new Map();
   for (const message of [...senderMessages, ...recipientMessages]) byId.set(message.id, message);
-  const messages = [...byId.values()]
-    .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
-    .slice(0, Number.isFinite(max) ? max : undefined);
+  const messages = sortNewestFirst([...byId.values()]).slice(0, limit);
   return { ...senderBuilt, messages };
 }
 
@@ -519,7 +577,7 @@ async function mutationMessages(args = {}, defaultFolder = "inbox", allowWholeFo
     }
     return { account, source, scoped, messages, batchSize: messages.length, more: false };
   }
-  const { messages: candidates } = await searchMessages(scoped, batchSize + 1);
+  const { messages: candidates } = await searchMessages(scoped, batchSize + 1, { newestFirst: false });
   const more = candidates.length > batchSize;
   const messages = more ? candidates.slice(0, batchSize) : candidates;
   return { account, source, scoped, messages, batchSize, more };
@@ -608,9 +666,7 @@ function contactVCard(name, email) {
 }
 
 async function contactCandidates(args = {}) {
-  const { account, query, folder, scope } = await buildMessageQuery(args);
-  const first = await messenger.messages.query(query);
-  const messages = await allMessagePages(first, Infinity);
+  const { account, folder, scope, messages } = await searchMessages(args, Infinity, { newestFirst: false });
   const ownEmails = new Set();
   const accounts = await messenger.accounts.list();
   for (const item of accounts) {
@@ -932,9 +988,7 @@ async function executeRequest(request) {
   }
 
   if (op === "senders") {
-    const { account, query, folder, scope } = await buildMessageQuery(args);
-    const first = await messenger.messages.query(query);
-    const messages = await allMessagePages(first, Infinity);
+    const { account, folder, scope, messages } = await searchMessages(args, Infinity, { newestFirst: false });
     const grouped = new Map();
     for (const message of messages) {
       const author = String(message.author || "(brak nadawcy)").trim() || "(brak nadawcy)";
@@ -965,9 +1019,7 @@ async function executeRequest(request) {
   }
 
   if (op === "largest") {
-    const { account, query, folder, scope } = await buildMessageQuery(args);
-    const first = await messenger.messages.query(query);
-    const messages = await allMessagePages(first, Infinity);
+    const { account, folder, scope, messages } = await searchMessages(args, Infinity, { newestFirst: false });
     const limit = Math.max(1, Math.min(Number(args.limit) || 40, 100));
     const totalBytes = messages.reduce((sum, message) => sum + (Number(message.size) || 0), 0);
     const largest = messages
@@ -987,7 +1039,7 @@ async function executeRequest(request) {
 
   if (op === "count" || op === "search") {
     const max = op === "search" ? Math.max(1, Math.min(Number(args.limit) || 20, 100)) : Infinity;
-    const { account, folder, scope, messages } = await searchMessages(args, max);
+    const { account, folder, scope, messages } = await searchMessages(args, max, { newestFirst: op === "search" });
     if (op === "count") {
       return {
         account: { id: account.id, name: account.name, type: account.type },
