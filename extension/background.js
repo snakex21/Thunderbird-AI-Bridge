@@ -194,6 +194,90 @@ async function verifyMovedMessages(account, source, destination, ids, requiredCo
   };
 }
 
+// Gmail has been seen dropping a label minutes after a move that verified
+// fine; the host should call verify_move after this delay.
+function moveRecheckAfterMs(account, gmail) {
+  if (String(account?.type || "").toLowerCase() !== "imap") return null;
+  return gmail ? 3 * 60 * 1000 : 60 * 1000;
+}
+
+const VERIFY_MOVE_MAX_IDS = 500;
+const VERIFY_MOVE_LOCATE_LIMIT = 20;
+
+// Read-only re-check of an earlier move: are the Message-IDs (still) in the
+// destination and gone from the source? Missing ones are located across the
+// account so a Gmail label drop ("only in All Mail") is visible.
+async function verifyMove(args = {}) {
+  const destinationSelector = String(args.destination || "").trim();
+  if (!destinationSelector) throw new Error("verify_move wymaga folderu docelowego w polu destination.");
+  // Compare case-insensitively, but keep the original spelling for the
+  // account-wide lookup (Thunderbird's headerMessageId query is exact).
+  const original = new Map();
+  for (const value of [
+    ...(Array.isArray(args.header_message_ids) ? args.header_message_ids : []),
+    ...(Array.isArray(args.headerMessageIds) ? args.headerMessageIds : []),
+  ]) {
+    const spelled = String(value || "").trim().replace(/^<|>$/g, "");
+    if (spelled && !original.has(spelled.toLowerCase())) original.set(spelled.toLowerCase(), spelled);
+  }
+  const ids = [...original.keys()];
+  if (!ids.length) throw new Error("verify_move wymaga header_message_ids (Message-ID z wyniku move).");
+  if (ids.length > VERIFY_MOVE_MAX_IDS) {
+    throw new Error(`verify_move sprawdza najwyżej ${VERIFY_MOVE_MAX_IDS} Message-ID naraz.`);
+  }
+  const account = await resolveAccount({ account: args.account || args.accountId, folder: destinationSelector });
+  const destination = await resolveFolder(account, destinationSelector);
+  const sourceSelector = String(args.source || "").trim();
+  const source = sourceSelector ? await resolveFolder(account, sourceSelector) : null;
+  let refreshed = false;
+  if (args.refresh !== false) {
+    refreshed = await refreshFolderIfPossible(destination);
+    if (source) refreshed = (await refreshFolderIfPossible(source)) && refreshed;
+  }
+  const destinationCounts = await folderMessageIdCounts(destination);
+  const sourceCounts = source ? await folderMessageIdCounts(source) : new Map();
+  const missing = ids.filter(id => !destinationCounts.get(id));
+  const stillInSource = ids.filter(id => sourceCounts.get(id));
+  const duplicates = ids.filter(id => (destinationCounts.get(id) || 0) > 1);
+  const allFolders = await messenger.folders.query({ accountId: account.id });
+  const gmail = isGmailAccount(account, allFolders);
+  const locations = [];
+  for (const id of missing.slice(0, VERIFY_MOVE_LOCATE_LIMIT)) {
+    let copies = [];
+    try {
+      const first = await messenger.messages.query({ accountId: account.id, headerMessageId: original.get(id) });
+      copies = await allMessagePages(first, Infinity);
+    } catch (_) {
+      copies = [];
+    }
+    const folders = [...new Set(copies.map(copy => copy?.folder?.path || copy?.folder?.name || copy?.folder?.id).filter(Boolean))];
+    const onlyInAllMail = gmail && copies.length > 0 && copies.every(copy => isGmailAllMailFolder(account, copy.folder));
+    locations.push({ headerMessageId: original.get(id), foundIn: folders, onlyInAllMail, notFound: copies.length === 0 });
+  }
+  const verified = missing.length === 0 && stillInSource.length === 0;
+  return {
+    account: { id: account.id, name: account.name, type: account.type },
+    source: source ? plainFolder(source) : null,
+    destination: plainFolder(destination),
+    checked: ids.length,
+    inDestination: ids.length - missing.length,
+    missingInDestinationCount: missing.length,
+    stillInSourceCount: stillInSource.length,
+    missingInDestination: missing.slice(0, 50),
+    stillInSource: stillInSource.slice(0, 50),
+    destinationDuplicates: duplicates.slice(0, 50),
+    locations,
+    labelDropped: locations.filter(item => item.onlyInAllMail).length,
+    refreshed,
+    verified,
+    status: verified ? "verified_moved" : "moved_but_unverified",
+    readOnly: true,
+    warning: verified ? undefined :
+      "Część wiadomości nie jest w folderze docelowym albo nadal jest w źródle. " +
+      "Sprawdź locations (onlyInAllMail = Gmail zdjął etykietę) przed kolejną partią; nie powtarzaj przeniesienia w ciemno.",
+  };
+}
+
 function trashCountsMeetRequired(actualCounts, requiredCounts) {
   return [...requiredCounts].every(([key, count]) =>
     (actualCounts.get(key) || 0) >= count
@@ -1356,6 +1440,10 @@ async function executeRequest(request) {
     };
   }
 
+  if (op === "verify_move") {
+    return verifyMove(args);
+  }
+
   if (op === "count" || op === "search") {
     const max = op === "search" ? Math.max(1, Math.min(Number(args.limit) || 20, 100)) : Infinity;
     const { account, folder, scope, messages, dedupe } = await searchMessages(args, max, {
@@ -1579,6 +1667,10 @@ async function executeRequest(request) {
     // Do not hand out a continuation for an unverified batch: the next batch
     // should wait until the user has checked the destination.
     const continuation = more && verification.verified ? saveBulkState("move", state) : "";
+    const movedMessageIds = [...new Set(messages
+      .map(message => String(message?.headerMessageId || "").trim().replace(/^<|>$/g, ""))
+      .filter(Boolean))];
+    const recheckAfterMs = moveRecheckAfterMs(account, gmail);
     return {
       account: { id: account.id, name: account.name, type: account.type },
       source: plainFolder(source),
@@ -1593,6 +1685,13 @@ async function executeRequest(request) {
       wholeFolder: args.all === true,
       moveMethod: "messages.move",
       ...verification,
+      messageIds: movedMessageIds,
+      recheckAfterMs,
+      // Ready-made read-only follow-up for the host (null for local folders).
+      recheck: recheckAfterMs === null || !movedMessageIds.length ? null : {
+        op: "verify_move",
+        args: { account: account.id, source: source.id, destination: destination.id, header_message_ids: movedMessageIds },
+      },
     };
   }
 
