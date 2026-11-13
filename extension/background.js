@@ -1233,7 +1233,28 @@ async function executeRequest(request) {
   }
 
   if (op === "largest") {
-    const { account, folder, scope, messages } = await searchMessages(args, Infinity, { newestFirst: false });
+    const { account, folder, scope, messages: scanned } = await searchMessages(args, Infinity, { newestFirst: false });
+    // On Gmail an account-wide scan sees one message once per label plus All
+    // Mail. Count each Message-ID once (preferring a non-All-Mail copy) so
+    // totals are not doubled. Other servers keep real duplicate copies.
+    const gmail = isGmailAccount(account, await messenger.folders.query({ accountId: account.id }));
+    let messages = scanned;
+    if (gmail) {
+      const byKey = new Map();
+      const unkeyed = [];
+      for (const message of scanned) {
+        const key = normalizedHeaderMessageId(message);
+        if (!key) {
+          unkeyed.push(message);
+          continue;
+        }
+        const kept = byKey.get(key);
+        if (!kept || (isGmailAllMailFolder(account, kept.folder) && !isGmailAllMailFolder(account, message.folder))) {
+          byKey.set(key, message);
+        }
+      }
+      messages = [...byKey.values(), ...unkeyed];
+    }
     const limit = Math.max(1, Math.min(Number(args.limit) || 40, 100));
     const totalBytes = messages.reduce((sum, message) => sum + (Number(message.size) || 0), 0);
     const largest = messages
@@ -1247,6 +1268,8 @@ async function executeRequest(request) {
       scope,
       totalMessages: messages.length,
       totalBytes,
+      deduplicatedByMessageId: gmail,
+      duplicatesSkipped: scanned.length - messages.length,
       largest,
     };
   }
