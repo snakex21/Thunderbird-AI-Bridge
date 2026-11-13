@@ -78,10 +78,13 @@ test("ambiguous folder names fail closed, stable IDs and exact paths still work"
   assert.equal((await context.resolveFolder(account, "/Archive")).id, "archive");
 });
 
-test("ambiguous account names fail closed and exact IDs beat substring names", async () => {
+test("ambiguous account names fail closed; exact IDs and exact names beat substring names", async () => {
   const { context, accounts } = fixture();
   accounts.unshift({ id: "account2", name: "Work account1", type: "imap" });
-  await assert.rejects(context.resolveAccount({ account: "Work" }), /[Nn]iejednoznacz/);
+  // Exact (case-insensitive) names win over substring matches; several
+  // substring matches still fail closed.
+  assert.equal((await context.resolveAccount({ account: "work" })).id, "account1");
+  await assert.rejects(context.resolveAccount({ account: "Wor" }), /[Nn]iejednoznacz/);
   assert.equal((await context.resolveAccount({ account: "account1" })).id, "account1");
 });
 

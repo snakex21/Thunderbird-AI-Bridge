@@ -304,16 +304,58 @@ async function allMessagePages(first, max = Infinity, predicate = null) {
 async function resolveAccount(args = {}) {
   const accounts = await messenger.accounts.list();
   if (!accounts.length) throw new Error("Thunderbird nie ma skonfigurowanego konta pocztowego.");
-  const wanted = String(args.account || args.accountId || "").trim().toLowerCase();
-  if (wanted) {
-    const byId = accounts.find(account => String(account.id || "") === String(args.account || args.accountId).trim());
+  const rawWanted = String(args.account || args.accountId || "").trim();
+  if (rawWanted) {
+    const byId = accounts.find(account => String(account.id || "") === rawWanted);
     if (byId) return byId;
-    const matches = accounts.filter(account => String(account.name || "").toLowerCase().includes(wanted));
-    if (!matches.length) throw new Error(`Nie znaleziono konta: ${args.account || args.accountId}`);
-    if (matches.length > 1) throw new Error("Niejednoznaczna nazwa konta; użyj accountId z operacji accounts.");
+    const wanted = rawWanted.toLowerCase();
+    const exact = accounts.filter(account => String(account.name || "").trim().toLowerCase() === wanted);
+    if (exact.length === 1) return exact[0];
+    const matches = exact.length ? exact : accounts.filter(account => String(account.name || "").toLowerCase().includes(wanted));
+    if (!matches.length) throw new Error(`Nie znaleziono konta: ${rawWanted}`);
+    if (matches.length > 1) {
+      throw new Error(`Niejednoznaczna nazwa konta "${rawWanted}" (${matches.map(account => account.name).join(", ")}); użyj accountId z operacji accounts.`);
+    }
     return matches[0];
   }
-  return accounts.find((account) => String(account.type || "").toLowerCase() === "imap") || accounts[0];
+
+  // Folder IDs carry their owning account ("account2://INBOX").
+  const folderSelector = String(args.folder || "").trim();
+  const prefix = folderSelector.match(/^([^:/\s]+):\/\//);
+  if (prefix) {
+    const owner = accounts.find(account => String(account.id || "") === prefix[1]);
+    if (owner) return owner;
+  }
+
+  const fallback = accounts.find((account) => String(account.type || "").toLowerCase() === "imap") || accounts[0];
+  const isMailAccount = account => String(account.type || "").toLowerCase() !== "none";
+  if (folderSelector && accounts.filter(isMailAccount).length > 1) {
+    // Never silently pick the first IMAP account when a friendly folder name
+    // (e.g. "Inbox", "Faktury") exists on several mail accounts.
+    const matching = [];
+    for (const account of accounts) {
+      if (await folderExistsIn(account, folderSelector)) matching.push(account);
+    }
+    const mailMatching = matching.filter(isMailAccount);
+    if (mailMatching.length > 1) {
+      throw new Error(
+        `Folder "${folderSelector}" istnieje na kilku kontach (${mailMatching.map(account => account.name).join(", ")}); ` +
+        "podaj account (accountId z operacji accounts) albo folder.id z operacji folders."
+      );
+    }
+    if (mailMatching.length === 1) return mailMatching[0];
+    if (matching.length === 1) return matching[0];
+  }
+  return fallback;
+}
+
+async function folderExistsIn(account, selector) {
+  try {
+    return Boolean(await resolveFolder(account, selector));
+  } catch (error) {
+    // An ambiguous name inside one account still means the name exists there.
+    return !/^Nie znaleziono folderu/.test(String(error?.message || ""));
+  }
 }
 
 async function resolveFolder(account, raw) {
