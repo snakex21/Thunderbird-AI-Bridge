@@ -1778,6 +1778,51 @@ let resultBytes = 0;
 let reservedBytes = 0;
 let capacityWarningShown = false;
 
+// Requests refused at capacity were never executed. Their small rejection is
+// remembered so a same-ID re-arrival gets the same answer instead of running
+// after the host already reported failure.
+const REJECTION_RECORD_LIMIT = 256;
+const REJECTION_TTL_MS = 10 * 60 * 1000;
+const rejectedRequests = new Map();
+const rejectionQueue = [];
+let rejectionWorkerRunning = false;
+
+// Per-operation execution limits. A timeout cannot cancel Thunderbird's own
+// work, so mutations report "outcome unknown"; reads change nothing.
+const READ_OPERATION_TIMEOUT_MS = 120 * 1000;
+const MUTATION_OPERATION_TIMEOUT_MS = 10 * 60 * 1000;
+const LONG_MUTATION_TIMEOUT_MS = 20 * 60 * 1000;
+const MUTATING_OPERATIONS = new Set([
+  "create_folder", "rename_folder", "delete_folder", "compact_folder", "create_address_book", "add_contacts",
+  "update_contact", "import_msg", "move", "copy", "trash", "restore", "empty_trash", "purge", "delete_permanently",
+]);
+
+function operationTimeoutMs(op) {
+  if (op === "compact_folder" || op === "empty_trash") return LONG_MUTATION_TIMEOUT_MS;
+  return MUTATING_OPERATIONS.has(op) ? MUTATION_OPERATION_TIMEOUT_MS : READ_OPERATION_TIMEOUT_MS;
+}
+
+async function executeWithTimeout(request) {
+  const op = String(request?.op || "").toLowerCase();
+  const ms = operationTimeoutMs(op);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const seconds = Math.round(ms / 1000);
+      console.warn(`Thunderbird Bridge operation ${op || "(none)"} (${request.id}) exceeded ${seconds} s.`);
+      reject(new Error(MUTATING_OPERATIONS.has(op)
+        ? `Operacja ${op} przekroczyła limit ${seconds} s w Thunderbirdzie; outcome unknown: mogła się wykonać lub nadal trwa. ` +
+          "Nie powtarzaj automatycznie; najpierw sprawdź stan skrzynki."
+        : `Operacja ${op} przekroczyła limit ${seconds} s w Thunderbirdzie (odczyt, bez zmian w skrzynce). Zawęź zapytanie (folder, daty, limit) i spróbuj ponownie.`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([executeRequest(request), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function hasRequestCapacity() {
   return requestRecords.size < RESULT_RECORD_LIMIT && resultBytes + reservedBytes + RESULT_MAX_BYTES <= RESULT_BYTE_LIMIT;
 }
@@ -1789,6 +1834,48 @@ function pruneRequestRecords() {
       resultBytes -= record.bytes;
       requestRecords.delete(id);
     }
+  }
+  for (const [id, rejection] of rejectedRequests) {
+    if (!rejection.queued && now - rejection.at >= REJECTION_TTL_MS) rejectedRequests.delete(id);
+  }
+}
+
+function queueRejection(rejection) {
+  if (rejection.queued) return;
+  rejection.queued = true;
+  rejectionQueue.push(rejection);
+  if (!rejectionWorkerRunning) void rejectionWorker();
+}
+
+function rejectForCapacity(request) {
+  if (rejectedRequests.size >= REJECTION_RECORD_LIMIT) return;
+  const rejection = {
+    at: Date.now(),
+    queued: false,
+    body: JSON.stringify({
+      id: request.id,
+      ok: false,
+      notExecuted: true,
+      error: "Thunderbird Bridge is at capacity (too many unacknowledged results); this request was NOT executed. " +
+        "Retry later with a new request id.",
+    }),
+  };
+  rejectedRequests.set(request.id, rejection);
+  queueRejection(rejection);
+}
+
+async function rejectionWorker() {
+  if (rejectionWorkerRunning) return;
+  rejectionWorkerRunning = true;
+  try {
+    while (rejectionQueue.length) {
+      const rejection = rejectionQueue.shift();
+      await deliverResult(rejection.body);
+      rejection.queued = false;
+    }
+  } finally {
+    rejectionWorkerRunning = false;
+    if (rejectionQueue.length) void rejectionWorker();
   }
 }
 
@@ -1838,12 +1925,18 @@ function enqueueRequest(request) {
   let record = requestRecords.get(request.id);
   if (record?.queued) return;
   if (!record) {
-    // Never send a terminal rejection without retaining its ID: a later
-    // same-ID arrival could otherwise execute after the host accepted failure.
-    // No admission means no side effect and no result; the caller may time out.
+    const rejected = rejectedRequests.get(request.id);
+    if (rejected) {
+      queueRejection(rejected);
+      return false;
+    }
+    // Unadmitted requests are never executed. The host gets an explicit
+    // not-executed error whose ID is retained (bounded), so a same-ID
+    // re-arrival cannot execute after the host accepted that failure.
     if (!hasRequestCapacity()) {
-      if (!capacityWarningShown) console.warn("Thunderbird Bridge recovery capacity exhausted; new requests are not admitted.");
+      if (!capacityWarningShown) console.warn("Thunderbird Bridge recovery capacity exhausted; new requests are rejected without execution.");
       capacityWarningShown = true;
+      rejectForCapacity(request);
       return false;
     }
     capacityWarningShown = false;
@@ -1866,7 +1959,7 @@ async function requestWorker() {
       if (record.completedAt === null) {
         let payload;
         try {
-          payload = { id: request.id, ok: true, data: await executeRequest(request) };
+          payload = { id: request.id, ok: true, data: await executeWithTimeout(request) };
         } catch (error) {
           payload = { id: request.id, ok: false, error: String(error?.message || error) };
         }

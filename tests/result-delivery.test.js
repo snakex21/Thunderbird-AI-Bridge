@@ -29,7 +29,9 @@ function fixture({ delivery = async () => ({ ok: true, status: 204 }), create, f
     console: { warn() {}, log() {} },
     AbortController, TextEncoder,
     Date: class extends Date { static now() { return now; } },
-    setTimeout: (fn, ms) => setTimeout(fn, ms === 5000 && !fastTimeout ? ms : 0), clearTimeout,
+    // Delivery delays run instantly; per-operation execution limits (>= 60 s)
+    // keep their real duration and are cleared when the operation settles.
+    setTimeout: (fn, ms) => setTimeout(fn, ms >= 60000 || (ms === 5000 && !fastTimeout) ? ms : 0), clearTimeout,
     fetch: async (url, options) => {
       if (url.includes("/poll?")) return new Promise(() => {});
       posts.push(options.body);
@@ -47,7 +49,7 @@ function fixture({ delivery = async () => ({ ok: true, status: 204 }), create, f
 }
 async function idle(f) {
   for (let i = 0; i < 1000; i++) {
-    if (!f.read("requestWorkerRunning")) return;
+    if (!f.read("requestWorkerRunning || rejectionWorkerRunning")) return;
     await new Promise(resolve => setTimeout(resolve, 1));
   }
   throw new Error("worker did not settle");
@@ -118,7 +120,13 @@ test("unacknowledged ID capacity applies backpressure without evicting old IDs",
   f.enqueue("overflow"); await idle(f);
   assert.equal(f.mutations(), 128);
   assert.equal(f.read("requestRecords.size"), 128);
-  assert.equal(f.posts.length, beforeOverflow, "capacity denial cannot become an unretained terminal result");
+  assert.equal(f.posts.length, beforeOverflow + 1, "capacity denial is reported explicitly");
+  const rejection = JSON.parse(f.posts.at(-1));
+  assert.equal(rejection.id, "overflow");
+  assert.equal(rejection.ok, false);
+  assert.equal(rejection.notExecuted, true);
+  assert.match(rejection.error, /NOT executed/);
+  assert.equal(f.read("rejectedRequests.has('overflow')"), true, "rejection is retained");
   f.enqueue("id-0"); await idle(f);
   assert.equal(f.mutations(), 128);
 });
@@ -132,7 +140,8 @@ test("reserve result memory before executing and never exceed byte budget", asyn
   f.enqueue("large-3"); await idle(f);
   assert.equal(f.read("requestRecords.size"), 2);
   assert.ok(f.read("resultBytes + reservedBytes <= RESULT_BYTE_LIMIT"));
-  assert.equal(f.posts.length, 2, "unadmitted request has no terminal result");
+  assert.equal(f.posts.length, 3);
+  assert.equal(JSON.parse(f.posts[2]).notExecuted, true, "unadmitted request gets an explicit not-executed error");
 });
 
 test("oversized UTF-8 results are bounded and report uncertainty without re-execution", async () => {
@@ -155,7 +164,7 @@ test("operation exceptions are cached separately from transport exceptions", asy
   assert.equal(f.posts[0], f.posts[1]);
 });
 
-test("pending requests reserve memory and reject overflow before side effects", async () => {
+test("pending requests reserve memory and explicitly reject overflow before side effects", async () => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   const f = fixture({ create: () => gate });
@@ -164,15 +173,20 @@ test("pending requests reserve memory and reject overflow before side effects", 
   assert.equal(f.read("reservedBytes"), 8 * 1024 * 1024);
   for (let i = 0; i < 1000; i++) f.enqueue(`overflow-${i}`);
   assert.equal(f.read("requestRecords.size"), 2);
-  assert.equal(f.posts.length, 0, "overflow cannot spawn untracked result-delivery tasks");
+  assert.equal(f.read("rejectedRequests.size"), 256, "retained rejections are bounded");
+  assert.ok(f.read("rejectionWorkerRunning"), "rejections use one sequential delivery worker");
   release(); await idle(f);
   assert.equal(f.mutations(), 2);
   assert.equal(f.read("reservedBytes"), 0);
-  assert.equal(f.posts.some(body => JSON.parse(body).id === "pending-3"), false);
+  const rejections = f.posts.map(body => JSON.parse(body)).filter(body => body.notExecuted);
+  assert.equal(rejections.length, 256);
+  assert.ok(rejections.some(body => body.id === "pending-3"));
   f.enqueue("pending-3"); await idle(f);
-  assert.equal(f.mutations(), 3, "previously unadmitted ID executes for the first time after capacity frees");
-  f.enqueue("pending-3"); await idle(f);
-  assert.equal(f.mutations(), 3);
+  assert.equal(f.mutations(), 2, "a rejected ID never executes later, even after capacity frees");
+  assert.equal(JSON.parse(f.posts.at(-1)).id, "pending-3");
+  assert.equal(JSON.parse(f.posts.at(-1)).notExecuted, true);
+  f.enqueue("pending-4"); await idle(f);
+  assert.equal(f.mutations(), 3, "a new ID executes once capacity frees");
 });
 
 test("late acknowledgement starts its own five-minute retention window", async () => {
@@ -208,4 +222,42 @@ test("hung delivery aborts and retries only the immutable result", async () => {
   assert.equal(f.posts.length, 3);
   assert.ok(f.posts.every(body => body === f.posts[0]));
   assert.equal(f.read("requestRecords.get('id-1').acknowledged"), false);
+});
+
+test("operation timeout reports outcome unknown for mutations and keeps the worker alive", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const warnings = [];
+  const f = fixture({ create: () => gate });
+  f.context.console.warn = message => warnings.push(message);
+  vm.runInContext("operationTimeoutMs = () => 5", f.context);
+  f.enqueue("slow"); await idle(f);
+  const result = JSON.parse(f.posts[0]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /outcome unknown/);
+  assert.ok(warnings.some(message => /create_folder/.test(message)));
+  release();
+  f.enqueue("slow"); await idle(f);
+  assert.equal(f.posts[1], f.posts[0], "a timed-out ID replays its result and is not re-executed");
+  assert.equal(f.mutations(), 1);
+  vm.runInContext("operationTimeoutMs = () => 60000", f.context);
+  f.enqueue("next", "Next"); await idle(f);
+  assert.equal(JSON.parse(f.posts.at(-1)).ok, true, "the worker continues with later requests");
+});
+
+test("read timeouts say nothing changed", async () => {
+  const f = fixture();
+  vm.runInContext("operationTimeoutMs = () => 5; executeRequest = () => new Promise(() => {})", f.context);
+  f.context.enqueueRequest({ id: "read-1", op: "search", args: {} }); await idle(f);
+  const result = JSON.parse(f.posts[0]);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /bez zmian/);
+  assert.doesNotMatch(result.error, /outcome unknown/);
+});
+
+test("operation limits: reads 120 s, mutations longer", () => {
+  const f = fixture();
+  assert.equal(f.read('operationTimeoutMs("search")'), 120000);
+  assert.ok(f.read('operationTimeoutMs("trash")') > 120000);
+  assert.ok(f.read('operationTimeoutMs("compact_folder")') >= f.read('operationTimeoutMs("trash")'));
 });
