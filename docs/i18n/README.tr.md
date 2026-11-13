@@ -39,6 +39,6 @@ npm test
 
 XPI `dist/thunderbird-ai-bridge.xpi` konumunda oluşturulur ve Thunderbird eklenti yöneticisinden elle kurulabilir.
 
-Durum: deneysel (`0.9.33`). Protokol `1.0` öncesinde değişebilir.
+Durum: deneysel (`0.9.34`). Protokol `1.0` öncesinde değişebilir.
 
 MIT lisansı. Mozilla veya Thunderbird ile bağlantısı olmayan bağımsız bir projedir.

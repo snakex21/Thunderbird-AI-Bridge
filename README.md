@@ -12,7 +12,7 @@ It is **not tied to one AI model, one CLI or one cloud provider**. The Thunderbi
 
 The project is designed for local-first use: Thunderbird talks to `127.0.0.1`, so mailbox access does not need to be exposed directly to the network.
 
-> Status: experimental, currently based on the working `0.9.33` bridge. The protocol may still change before `1.0`.
+> Status: experimental, currently based on the working `0.9.34` bridge. The protocol may still change before `1.0`.
 
 ## Why this exists
 

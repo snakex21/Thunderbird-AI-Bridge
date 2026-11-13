@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.34 - 2026-11-13
+
+### Fixed after live testing (2026-11-13)
+
+- `repair_folder` on a Gmail label returned `repaired: true, completed: true, after.records: 0` after 185 ms while Thunderbird was still rebuilding the index from the server (a few seconds later the folder had the correct 67 records). After the rebuild the bridge now re-counts the folder with a backoff (up to 60 s) until the record count is stable in two consecutive checks and non-zero when the folder had records before. Otherwise it returns `completed: false`, `rebuildInProgress: true`, the last observed count (`lastObservedRecords`) and the warning "Przebudowa indeksu trwa — sprawdź ponownie za chwilę". New result fields: `rebuildInProgress`, `lastObservedRecords`, `settleChecks`, `settleMs`.
+
 ## 0.9.33 - 2026-11-13
 
 ### Fixed after live testing (2026-11-13)

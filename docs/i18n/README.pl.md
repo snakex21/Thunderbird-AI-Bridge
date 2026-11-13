@@ -44,6 +44,6 @@ Testy:
 npm test
 ```
 
-Projekt jest eksperymentalny (`0.9.33`) i protokół może się jeszcze zmienić przed wersją `1.0`.
+Projekt jest eksperymentalny (`0.9.34`) i protokół może się jeszcze zmienić przed wersją `1.0`.
 
 Licencja: MIT. Projekt jest niezależny i nie jest oficjalnym produktem Mozilli ani Thunderbirda.
