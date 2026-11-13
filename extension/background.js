@@ -568,8 +568,8 @@ async function resolveAddressBook(raw, requireWritable = true) {
   let book = wanted
     ? books.find(item => String(item.id || "").toLowerCase() === wanted || String(item.name || "").toLowerCase() === wanted)
     : books.find(item => !item.readOnly && !item.remote);
-  if (!book) throw new Error(wanted ? `Nie znaleziono ksiÄ…ĹĽki adresowej: ${raw}` : "Nie znaleziono lokalnej ksiÄ…ĹĽki adresowej.");
-  if (requireWritable && (book.readOnly || book.remote)) throw new Error("Wybrana ksiÄ…ĹĽka adresowa jest tylko do odczytu.");
+  if (!book) throw new Error(wanted ? `Nie znaleziono książki adresowej: ${raw}` : "Nie znaleziono lokalnej książki adresowej.");
+  if (requireWritable && (book.readOnly || book.remote)) throw new Error("Wybrana książka adresowa jest tylko do odczytu.");
   return book;
 }
 
@@ -701,7 +701,7 @@ async function executeRequest(request) {
   }
 
   if (op === "create_address_book") {
-    if (!args.confirm) throw new Error("create_address_book wymaga confirm:true po wyraĹşnej zgodzie uĹĽytkownika.");
+    if (!args.confirm) throw new Error("create_address_book wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     const name = String(args.name || "").trim();
     if (!name) throw new Error("create_address_book wymaga name.");
     const books = await messenger.addressBooks.list(true);
@@ -713,10 +713,10 @@ async function executeRequest(request) {
   }
 
   if (op === "add_contacts") {
-    if (!args.confirm) throw new Error("add_contacts wymaga confirm:true po wyraĹşnej zgodzie uĹĽytkownika.");
+    if (!args.confirm) throw new Error("add_contacts wymaga confirm:true po wyraźnej zgodzie użytkownika.");
     const requested = Array.isArray(args.contacts) ? args.contacts : [];
     if (!requested.length) throw new Error("add_contacts wymaga niepustej listy contacts.");
-    if (requested.length > 200) throw new Error("Jedna operacja moĹĽe dodaÄ‡ najwyĹĽej 200 kontaktĂłw.");
+    if (requested.length > 200) throw new Error("Jedna operacja może dodać najwyżej 200 kontaktów.");
     const book = await resolveAddressBook(args.address_book || args.addressBook, true);
     const existingEmails = new Set();
     const listed = Array.isArray(book.contacts) ? book.contacts : await messenger.contacts.list(book.id);
@@ -1183,8 +1183,8 @@ async function executeRequest(request) {
     if (source.id === destination.id) throw new Error("Folder źródłowy i docelowy są takie same.");
     if (isGmailAllMailFolder(account, source) && destinationAccount.id === account.id) {
       throw new Error(
-        "Kopiowanie z Gmail All Mail/Wszystkie do tego samego konta jest zablokowane: stary IMAP moĹĽe tworzyÄ‡ duplikaty i dĹ‚ugo czekaÄ‡ na synchronizacjÄ™. " +
-        "Kopiuj z All Mail wyĹ‚Ä…cznie do Local Folders albo uĹĽyj zwykĹ‚ej etykiety w Gmailu."
+        "Kopiowanie z Gmail All Mail/Wszystkie do tego samego konta jest zablokowane: stary IMAP może tworzyć duplikaty i długo czekać na synchronizację. " +
+        "Kopiuj z All Mail wyłącznie do Local Folders albo użyj zwykłej etykiety w Gmailu."
       );
     }
     const ids = messages.map(message => message.id);
