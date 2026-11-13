@@ -31,7 +31,8 @@ function fixture() {
       },
     },
   };
-  const context = vm.createContext({ messenger, console, setTimeout, clearTimeout, fetch: async () => new Promise(() => {}) });
+  // Settle/verification delays run instantly; no real mailbox timing here.
+  const context = vm.createContext({ messenger, console, setTimeout: fn => setTimeout(fn, 0), clearTimeout, fetch: async () => new Promise(() => {}) });
   vm.runInContext(background, context);
   return { context, messenger, account, accounts, folders, mutations };
 }

@@ -131,6 +131,69 @@ async function assertGmailLabelSourceSafe(op, account, source, messages) {
   );
 }
 
+const MOVE_VERIFY_ATTEMPTS = 30;
+const MOVE_VERIFY_INTERVAL_MS = 500;
+
+function moveSettleMs(account, gmail) {
+  if (String(account?.type || "").toLowerCase() !== "imap") return 0;
+  return gmail ? 10000 : 5000;
+}
+
+async function refreshFolderIfPossible(folder) {
+  if (!messenger.mailbridge?.refreshFolder || !folder?.accountId || !folder?.path) return false;
+  try {
+    return Boolean(await messenger.mailbridge.refreshFolder(folder.accountId, folder.path));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Gmail can accept a move optimistically and later drop the label again
+// (messages left only in All Mail) or leave duplicate local headers. Check
+// once immediately, then again after a settle window and a server refresh,
+// and report movedButUnverified instead of success when the result did not
+// survive.
+async function verifyMovedMessages(account, source, destination, ids, requiredCounts, gmail) {
+  const check = async () => {
+    const counts = await folderMessageIdCounts(destination);
+    const missing = [...requiredCounts].filter(([key, count]) => (counts.get(key) || 0) < count).map(([key]) => key);
+    const duplicates = [...requiredCounts].filter(([key, count]) => (counts.get(key) || 0) > count).map(([key]) => key);
+    const sourceVerified = await sourceMessagesGone(ids, source.id);
+    return { missing, duplicates, sourceVerified, ok: missing.length === 0 && sourceVerified };
+  };
+  let result = { missing: [...requiredCounts.keys()], duplicates: [], sourceVerified: false, ok: false };
+  for (let attempt = 0; attempt < MOVE_VERIFY_ATTEMPTS; attempt++) {
+    result = await check();
+    if (result.ok) break;
+    await sleep(MOVE_VERIFY_INTERVAL_MS);
+  }
+  const immediateVerified = result.ok;
+  const settleMs = moveSettleMs(account, gmail);
+  let refreshed = false;
+  if (settleMs > 0) {
+    await sleep(settleMs);
+    refreshed = (await refreshFolderIfPossible(destination)) && (await refreshFolderIfPossible(source));
+    result = await check();
+  }
+  const verified = result.ok;
+  return {
+    verified,
+    immediateVerified,
+    destinationVerified: result.missing.length === 0,
+    sourceVerified: result.sourceVerified,
+    settleMs,
+    refreshed,
+    movedButUnverified: verified ? 0 : Math.max(result.missing.length, result.sourceVerified ? 0 : 1),
+    missingInDestination: result.missing.slice(0, 20),
+    destinationDuplicates: result.duplicates.slice(0, 20),
+    status: verified ? "verified_moved" : "moved_but_unverified",
+    warning: verified
+      ? (result.duplicates.length ? "Folder docelowy pokazuje część wiadomości więcej niż raz (prawdopodobnie nieodświeżony widok Thunderbirda); sprawdź go po synchronizacji." : undefined)
+      : "Przeniesienie nie przetrwało weryfikacji po synchronizacji: część wiadomości nie jest w folderze docelowym lub nadal jest w źródle. " +
+        "Sprawdź folder docelowy oraz Wszystkie/All Mail przed kolejną partią; nie powtarzaj operacji w ciemno.",
+  };
+}
+
 function trashCountsMeetRequired(actualCounts, requiredCounts) {
   return [...requiredCounts].every(([key, count]) =>
     (actualCounts.get(key) || 0) >= count
@@ -1337,11 +1400,33 @@ async function executeRequest(request) {
       };
     }
 
+    const gmail = isGmailAccount(account, await messenger.folders.query({ accountId: account.id }));
+    const expectedCounts = new Map();
+    for (const message of messages) {
+      const key = normalizedHeaderMessageId(message);
+      if (key) expectedCounts.set(key, (expectedCounts.get(key) || 0) + 1);
+    }
+    const beforeDestinationCounts = await folderMessageIdCounts(destination);
+    // Gmail labels hold one copy per message: moving into a label the message
+    // already carries adds nothing, so require presence there. Elsewhere each
+    // moved message must add a copy.
+    const requiredCounts = new Map();
+    for (const [key, count] of expectedCounts) {
+      const before = beforeDestinationCounts.get(key) || 0;
+      requiredCounts.set(key, gmail ? Math.max(before, 1) : before + count);
+    }
+
+    // messages.move lets Thunderbird use IMAP MOVE (Gmail supports it) or its
+    // own COPY + \Deleted + EXPUNGE. A bridge-level copy+delete is not used:
+    // on Gmail a delete from Inbox goes to Trash and drops every label.
     await inChunks(ids, 100, async (chunk) => {
       await messenger.messages.move(chunk, destination.id, { isUserAction: true });
     });
+    const verification = await verifyMovedMessages(account, source, destination, ids, requiredCounts, gmail);
     state.processed += ids.length;
-    const continuation = more ? saveBulkState("move", state) : "";
+    // Do not hand out a continuation for an unverified batch: the next batch
+    // should wait until the user has checked the destination.
+    const continuation = more && verification.verified ? saveBulkState("move", state) : "";
     return {
       account: { id: account.id, name: account.name, type: account.type },
       source: plainFolder(source),
@@ -1354,6 +1439,8 @@ async function executeRequest(request) {
       continuation,
       permanent: false,
       wholeFolder: args.all === true,
+      moveMethod: "messages.move",
+      ...verification,
     };
   }
 

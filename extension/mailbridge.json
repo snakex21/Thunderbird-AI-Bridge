@@ -43,6 +43,16 @@
         ]
       },
       {
+        "name": "refreshFolder",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "accountId", "type": "string"},
+          {"name": "path", "type": "string"}
+        ],
+        "returns": {"type": "boolean"}
+      },
+      {
         "name": "deleteFolderAndRefresh",
         "type": "function",
         "async": true,

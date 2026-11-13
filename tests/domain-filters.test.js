@@ -56,7 +56,7 @@ function fixture() {
     },
     runtime: { getManifest: () => ({ version: "test" }) },
   };
-  const context = vm.createContext({ messenger, console, setTimeout, clearTimeout, fetch: async () => new Promise(() => {}) });
+  const context = vm.createContext({ messenger, console, setTimeout: fn => setTimeout(fn, 0), clearTimeout, fetch: async () => new Promise(() => {}) });
   vm.runInContext(background, context);
   return { context, moved, queries };
 }

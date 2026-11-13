@@ -215,6 +215,27 @@ var mailbridge = class extends ExtensionCommon.ExtensionAPI {
           return true;
         },
 
+        // Ask the server for the folder's current state (IMAP SELECT/FETCH)
+        // so post-move verification sees the synchronized view rather than
+        // Thunderbird's optimistic local move.
+        async refreshFolder(accountId, path) {
+          const folder = context.extension.folderManager.get(accountId, path);
+          if (!folder) {
+            throw new Error(`Nie znaleziono natywnego folderu Thunderbird: ${accountId} ${path}`);
+          }
+          if (typeof folder.updateFolderWithListener === "function") {
+            await runFolderUrl(
+              listener => folder.updateFolderWithListener(null, listener),
+              "odświeżania folderu",
+              20000
+            );
+          } else {
+            folder.updateFolder(null);
+            await new Promise(resolve => setTimeout(resolve, 1500));
+          }
+          return true;
+        },
+
         async deleteFolderAndRefresh(accountId, path) {
           try {
             const folder = context.extension.folderManager.get(accountId, path);
