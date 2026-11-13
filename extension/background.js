@@ -7,6 +7,39 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const REPAIR_IN_PROGRESS_WARNING = "Przebudowa indeksu trwa — sprawdź ponownie za chwilę.";
+// Upper bound for waiting on the rebuilt index after repair_folder; well
+// inside the op's 20 min limit. `let` so tests can shorten the delays.
+let REPAIR_SETTLE_TIMEOUT_MS = 60 * 1000;
+let REPAIR_SETTLE_INITIAL_DELAY_MS = 250;
+let REPAIR_SETTLE_MAX_DELAY_MS = 5000;
+
+// Measures until two consecutive checks report the same record count (and a
+// non-zero one when the folder had records before the repair), with an
+// exponential backoff capped at REPAIR_SETTLE_TIMEOUT_MS.
+async function waitForRepairedCount(measure, before) {
+  const started = Date.now();
+  const deadline = started + REPAIR_SETTLE_TIMEOUT_MS;
+  const needNonZero = Boolean(before && before.records > 0);
+  let delay = REPAIR_SETTLE_INITIAL_DELAY_MS;
+  let previous = null;
+  let last = null;
+  let checks = 0;
+  for (;;) {
+    last = await measure();
+    checks++;
+    const usable = last !== null && (!needNonZero || last.records > 0);
+    if (usable && previous !== null && previous.records === last.records) {
+      return { stable: true, last, checks, elapsedMs: Date.now() - started };
+    }
+    previous = usable ? last : null;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { stable: false, last, checks, elapsedMs: Date.now() - started };
+    await sleep(Math.min(delay, remaining));
+    delay = Math.min(delay * 2, REPAIR_SETTLE_MAX_DELAY_MS);
+  }
+}
+
 function plainFolder(folder) {
   if (!folder) return null;
   const capabilities = folder.capabilities || {};
@@ -1292,19 +1325,38 @@ async function executeRequest(request) {
     if (!native?.started) {
       throw new Error(native?.error || "Thunderbird nie uruchomił naprawy folderu. Nic nie zmieniono.");
     }
-    const after = await measure();
+    // Thunderbird reports the rebuild URL as done before the new index is
+    // filled from the server (live: 0 records after 185 ms, 67 a few seconds
+    // later). Poll until the record count is the same twice in a row and,
+    // when the folder had records before, non-zero.
+    const settle = await waitForRepairedCount(measure, before);
+    const after = settle.last;
+    const stable = settle.stable;
+    const nativeOk = native.completed === true && !native.error;
+    const rebuildInProgress = !stable || native.completed !== true;
+    let warning;
+    if (!stable) {
+      warning = `${REPAIR_IN_PROGRESS_WARNING} Ostatnio widoczna liczba rekordów: ${after ? after.records : "nieznana"}` +
+        (before ? ` (przed naprawą: ${before.records})` : "") +
+        ". Wiadomości nie zostały usunięte; sprawdź folder (count / folders z include_unique_counts) za chwilę.";
+    } else if (!nativeOk) {
+      warning = "Thunderbird nadal przebudowuje indeks folderu. Wiadomości nie zostały usunięte; sprawdź folder (count / folders z include_unique_counts) za kilka minut.";
+    }
     return {
       account: { id: account.id, name: account.name, type: account.type },
       folder: plainFolder(folder),
-      repaired: native.completed === true && !native.error,
-      completed: native.completed === true,
+      repaired: nativeOk && stable,
+      completed: native.completed === true && stable,
+      rebuildInProgress,
       rebuildError: native.error || undefined,
       offlineStoreRemoved: native.offlineStoreRemoved === true,
       before,
       after,
+      lastObservedRecords: after ? after.records : null,
+      settleChecks: settle.checks,
+      settleMs: settle.elapsedMs,
       messagesDeleted: false,
-      warning: native.completed === true && !native.error ? undefined :
-        "Thunderbird nadal przebudowuje indeks folderu. Wiadomości nie zostały usunięte; sprawdź folder (count / folders z include_unique_counts) za kilka minut.",
+      warning,
     };
   }
 
