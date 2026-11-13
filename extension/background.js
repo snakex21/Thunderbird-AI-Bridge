@@ -2223,7 +2223,7 @@ async function postResult(body) {
   try {
     const response = await fetch(`${BRIDGE_URL}/result?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json; charset=utf-8" },
       body,
       signal: controller.signal,
     });

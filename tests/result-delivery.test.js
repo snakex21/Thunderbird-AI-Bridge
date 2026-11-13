@@ -281,3 +281,24 @@ test("poll loop pauses after HTTP 204 instead of busy-waiting", async () => {
   assert.equal(polls, 1, "a 204 must not immediately trigger another poll");
   assert.deepEqual(delays, [250]);
 });
+
+test("results and errors are posted as UTF-8 JSON with Polish characters intact", async () => {
+  const headers = [];
+  const f = fixture({ delivery: async (_, options) => { headers.push(options.headers["Content-Type"]); return { ok: true, status: 204 }; } });
+  f.enqueue("utf-ok", "Żółć – ąęśń 📧 \udc00");
+  f.context.enqueueRequest({ id: "utf-err", op: "rename_folder", args: {} });
+  await idle(f);
+  assert.equal(f.posts.length, 2);
+  assert.deepEqual(headers, ["application/json; charset=utf-8", "application/json; charset=utf-8"]);
+  const decode = body => {
+    assert.equal(typeof body, "string", "fetch encodes a string body as UTF-8");
+    const bytes = new TextEncoder().encode(body);
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  };
+  const ok = decode(f.posts[0]);
+  assert.equal(ok.data.created.name, "Żółć – ąęśń 📧 \udc00");
+  assert.ok(f.posts[0].includes("\\udc00"), "a lone surrogate is escaped, so the body stays valid UTF-8");
+  const failed = decode(f.posts[1]);
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /wyraźnej zgodzie użytkownika/);
+});
