@@ -43,5 +43,6 @@ test("Gmail account-wide largest counts each Message-ID once", async () => {
 test("non-Gmail servers keep real duplicate copies", async () => {
   const result = await fixture("Firma").executeRequest({ op: "largest", args: { scope: "account" } });
   assert.equal(result.totalMessages, 5);
-  assert.equal(result.deduplicatedByMessageId, false);
+  assert.equal(result.crossFolderDeduplication, false);
+  assert.equal(result.duplicatesSkipped, 0);
 });

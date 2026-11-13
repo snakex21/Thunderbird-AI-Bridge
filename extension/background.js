@@ -520,6 +520,67 @@ function mailboxesMatchDomain(values, spec) {
   });
 }
 
+// Thunderbird can return one message more than once:
+// - Gmail exposes a message once per label plus All Mail, so an account-wide
+//   scan sees the same Message-ID in several folders;
+// - a folder's local index can hold duplicate records for one message after
+//   IMAP moves (seen live: 75 records for 67 Message-IDs in one label).
+// Read-only reports count each Message-ID once per folder, and on Gmail once
+// per account (preferring a non-All-Mail copy). Within one folder the record
+// with the highest Thunderbird id (the newest index entry) is kept. Messages
+// without a Message-ID are never merged. Mutations never use this.
+function dedupeMessagesByMessageId(account, messages, gmail) {
+  const byKey = new Map();
+  const unkeyed = [];
+  let duplicateRecords = 0;
+  let crossFolderDuplicates = 0;
+  const allMail = message => isGmailAllMailFolder(account, message?.folder);
+  for (const message of messages) {
+    const messageId = normalizedHeaderMessageId(message);
+    if (!messageId) {
+      unkeyed.push(message);
+      continue;
+    }
+    const key = gmail ? messageId : `${message?.folder?.id ?? ""}\u0000${messageId}`;
+    const kept = byKey.get(key);
+    if (!kept) {
+      byKey.set(key, message);
+      continue;
+    }
+    const sameFolder = (kept.folder?.id ?? "") === (message.folder?.id ?? "");
+    if (sameFolder) duplicateRecords++;
+    else crossFolderDuplicates++;
+    const better = sameFolder
+      ? (Number(message.id) || 0) > (Number(kept.id) || 0)
+      : allMail(kept) && !allMail(message);
+    if (better) byKey.set(key, message);
+  }
+  const keptSet = new Set([...byKey.values(), ...unkeyed]);
+  return {
+    // Keep the caller's order.
+    messages: messages.filter(message => keptSet.has(message)),
+    duplicateRecords,
+    crossFolderDuplicates,
+  };
+}
+
+function wantsRawDuplicates(args = {}) {
+  return args.include_duplicates === true || args.includeDuplicates === true;
+}
+
+// Result fields shared by count/search/senders/largest.
+function dedupeResultFields(dedupe) {
+  if (!dedupe) return { deduplicatedByMessageId: false, duplicatesSkipped: 0, duplicateRecords: 0, crossFolderDuplicates: 0 };
+  return {
+    deduplicatedByMessageId: true,
+    crossFolderDeduplication: dedupe.crossFolder,
+    scannedRecords: dedupe.scannedRecords,
+    duplicatesSkipped: dedupe.duplicatesSkipped,
+    duplicateRecords: dedupe.duplicateRecords,
+    crossFolderDuplicates: dedupe.crossFolderDuplicates,
+  };
+}
+
 function sortNewestFirst(messages) {
   return messages.sort((a, b) =>
     (new Date(b.date || 0) - new Date(a.date || 0)) || (Number(b.id) || 0) - (Number(a.id) || 0)
@@ -532,16 +593,38 @@ function sortNewestFirst(messages) {
 // passes newestFirst:false to keep its early stop after batch_size + 1.
 async function searchMessages(args = {}, max = Infinity, options = {}) {
   const newestFirst = options.newestFirst !== false;
+  // Deduplication needs every match, so it implies a full scan.
+  const dedupe = options.dedupe === true;
   const limit = Number.isFinite(max) ? max : undefined;
   const collect = async built => {
     const first = await messenger.messages.query(built.query);
-    return allMessagePages(first, newestFirst ? Infinity : max, built.filter);
+    return allMessagePages(first, newestFirst || dedupe ? Infinity : max, built.filter);
+  };
+  const finish = async (built, scanned, sort = newestFirst) => {
+    let messages = scanned;
+    let dedupeInfo = {};
+    if (dedupe) {
+      const gmail = isGmailAccount(built.account, await messenger.folders.query({ accountId: built.account.id }));
+      const result = dedupeMessagesByMessageId(built.account, scanned, gmail);
+      messages = result.messages;
+      dedupeInfo = {
+        dedupe: {
+          deduplicatedByMessageId: true,
+          crossFolder: gmail,
+          scannedRecords: scanned.length,
+          duplicatesSkipped: scanned.length - messages.length,
+          duplicateRecords: result.duplicateRecords,
+          crossFolderDuplicates: result.crossFolderDuplicates,
+        },
+      };
+    }
+    if (sort) messages = sortNewestFirst(messages);
+    return { ...built, ...dedupeInfo, messages: messages.slice(0, limit) };
   };
   const address = String(args.address || "").trim();
   if (!address || domainFilterSpec(address)) {
     const built = await buildMessageQuery(args);
-    const messages = await collect(built);
-    return { ...built, messages: newestFirst ? sortNewestFirst(messages).slice(0, limit) : messages };
+    return finish(built, await collect(built));
   }
 
   // Thunderbird exposes sender and To-recipient as separate query fields.
@@ -554,8 +637,8 @@ async function searchMessages(args = {}, max = Infinity, options = {}) {
   const [senderMessages, recipientMessages] = await Promise.all([collect(senderBuilt), collect(recipientBuilt)]);
   const byId = new Map();
   for (const message of [...senderMessages, ...recipientMessages]) byId.set(message.id, message);
-  const messages = sortNewestFirst([...byId.values()]).slice(0, limit);
-  return { ...senderBuilt, messages };
+  // The merged From/To result is always sorted (also for mutation selection).
+  return finish(senderBuilt, [...byId.values()], true);
 }
 
 function hasMutationFilter(args = {}) {
@@ -1202,7 +1285,7 @@ async function executeRequest(request) {
   }
 
   if (op === "senders") {
-    const { account, folder, scope, messages } = await searchMessages(args, Infinity, { newestFirst: false });
+    const { account, folder, scope, messages, dedupe } = await searchMessages(args, Infinity, { newestFirst: false, dedupe: !wantsRawDuplicates(args) });
     const grouped = new Map();
     for (const message of messages) {
       const author = String(message.author || "(brak nadawcy)").trim() || "(brak nadawcy)";
@@ -1228,33 +1311,13 @@ async function executeRequest(request) {
       scope,
       totalMessages: messages.length,
       senderCount: grouped.size,
+      ...dedupeResultFields(dedupe),
       senders,
     };
   }
 
   if (op === "largest") {
-    const { account, folder, scope, messages: scanned } = await searchMessages(args, Infinity, { newestFirst: false });
-    // On Gmail an account-wide scan sees one message once per label plus All
-    // Mail. Count each Message-ID once (preferring a non-All-Mail copy) so
-    // totals are not doubled. Other servers keep real duplicate copies.
-    const gmail = isGmailAccount(account, await messenger.folders.query({ accountId: account.id }));
-    let messages = scanned;
-    if (gmail) {
-      const byKey = new Map();
-      const unkeyed = [];
-      for (const message of scanned) {
-        const key = normalizedHeaderMessageId(message);
-        if (!key) {
-          unkeyed.push(message);
-          continue;
-        }
-        const kept = byKey.get(key);
-        if (!kept || (isGmailAllMailFolder(account, kept.folder) && !isGmailAllMailFolder(account, message.folder))) {
-          byKey.set(key, message);
-        }
-      }
-      messages = [...byKey.values(), ...unkeyed];
-    }
+    const { account, folder, scope, messages, dedupe } = await searchMessages(args, Infinity, { newestFirst: false, dedupe: !wantsRawDuplicates(args) });
     const limit = Math.max(1, Math.min(Number(args.limit) || 40, 100));
     const totalBytes = messages.reduce((sum, message) => sum + (Number(message.size) || 0), 0);
     const largest = messages
@@ -1268,19 +1331,22 @@ async function executeRequest(request) {
       scope,
       totalMessages: messages.length,
       totalBytes,
-      deduplicatedByMessageId: gmail,
-      duplicatesSkipped: scanned.length - messages.length,
+      ...dedupeResultFields(dedupe),
       largest,
     };
   }
 
   if (op === "count" || op === "search") {
     const max = op === "search" ? Math.max(1, Math.min(Number(args.limit) || 20, 100)) : Infinity;
-    const { account, folder, scope, messages } = await searchMessages(args, max, { newestFirst: op === "search" });
+    const { account, folder, scope, messages, dedupe } = await searchMessages(args, max, {
+      newestFirst: op === "search",
+      dedupe: !wantsRawDuplicates(args),
+    });
     if (op === "count") {
       return {
         account: { id: account.id, name: account.name, type: account.type },
         count: messages.length,
+        ...dedupeResultFields(dedupe),
         query: {
           from: args.from || args.author || "",
           to: args.to || args.recipient || "",
@@ -1301,6 +1367,7 @@ async function executeRequest(request) {
     return {
       account: { id: account.id, name: account.name, type: account.type },
       count: enriched.length,
+      ...dedupeResultFields(dedupe),
       attachmentsIncluded: includeAttachments,
       messages: enriched,
     };
