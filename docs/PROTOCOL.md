@@ -114,7 +114,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `purge`
 - `delete_permanently`
 
-Mutating operations that can change or destroy user data require `confirm: true` where enforced by the extension.
+Mutating operations require the JSON boolean `confirm: true`. Strings such as `"true"` or `"false"`, numbers and other truthy values are rejected.
 
 ### Address books and contacts
 
@@ -154,6 +154,10 @@ Example:
   }
 }
 ```
+
+Account and folder selectors must be unambiguous. Automatic Inbox/Trash resolution also rejects multiple special-use matches or ambiguous fallback names. Exact account/folder IDs take precedence over display names; exact folder paths take precedence over name matching. If multiple accounts or folders match a friendly name, use an ID from `accounts`/`folders` or an exact full folder path. A missing Inbox is an error, not an implicit account-wide search; use `scope: "account"` explicitly for account-wide reads.
+
+`address` performs a sender-or-recipient search and overrides `from`/`author` and `to`/`recipient`. Other filters (subject, text and dates) still apply. The same matching semantics apply to bulk mutations.
 
 ## Reading a message
 
@@ -198,7 +202,7 @@ System/root folders are protected from rename/delete actions.
 }
 ```
 
-The host should send the returned continuation token with the same operation and filters to process the next batch. Continuation tokens expire and are tied to an operation fingerprint to reduce accidental filter changes during a destructive job.
+The host should send the returned continuation token with the same operation and filters to process the next batch. Continuation tokens expire and are tied to the operation, account, source, resolved destination ID (including default Trash/Inbox destinations), supplied destination selector, sender, recipient, address, subject, text, dates and subfolder scope to reduce accidental filter changes during a destructive job. A mismatched request is rejected without consuming its valid token. Bulk filters may use `from`/`author`, `to`/`recipient`, `address`, `subject`, `fullText`/`text`, `since` or `until`.
 
 `dry_run: true` can be used by supported bulk operations to inspect how many messages would be affected before performing the mutation.
 
@@ -206,7 +210,9 @@ The host should send the returned continuation token with the same operation and
 
 Permanent deletion is deliberately restricted to Thunderbird's default Trash folder. On IMAP accounts the bridge uses Thunderbird's native compact/EXPUNGE behavior and verifies mailbox state before reporting final success where possible.
 
-`empty_trash` uses Thunderbird's native server-side Empty Trash operation.
+`empty_trash` uses Thunderbird's native server-side Empty Trash operation. If messages remain after refresh, it returns `serverVerified: false` and `status: "verification_failed"`.
+
+A purge whose native compaction was skipped cannot confirm server EXPUNGE: it returns `serverVerified: false`, `pendingExpunge: true` and, when matching messages are locally gone, `status: "server_expunge_not_confirmed"`. A refresh error also leaves `pendingExpunge: true`. Hosts must inspect verification/status fields rather than treating transport `ok: true` as proof of permanent deletion.
 
 ## Host implementation guidance
 
@@ -222,3 +228,52 @@ The host is free to expose any interface on its other side: CLI commands, MCP to
 ## Compatibility
 
 The protocol is experimental until `1.0`. If you build another host implementation, pin the extension version and expect small field/operation changes while the API is being cleaned up.
+
+## Result delivery and uncertain outcomes
+
+Execution and delivery are separate. The extension serializes the operation result
+once, then retries only `POST /result` (up to three attempts, five-second HTTP
+timeout, 250 ms then 1 s delays). A network error or lost acknowledgement never
+turns successful execution into an operation-failed payload. HTTP 4xx except
+408/429 stops delivery retries. Unacknowledged results remain available for a
+same-ID redelivery, but there is no automatic re-execution or indefinite HTTP
+retry loop.
+
+A request ID identifies one operation. For admitted requests, while retained, duplicate IDs queued,
+executing, or completed never execute again; a completed duplicate replays the
+identical serialized result. Changing arguments under an existing ID does not
+change that operation. A genuinely new ID is a new operation even with identical
+arguments. Hosts must never generate a new ID as an automatic retry of an
+uncertain mutation.
+
+The process-local recovery cache holds at most 128 IDs and 8 MiB of UTF-8 result
+payloads, reserving 4 MiB per admitted pending request. When either bound would
+be exceeded, a new request is left unadmitted and unexecuted, with no result
+posted; its caller may time out. Sending a terminal rejection without remembering
+its ID would be unsafe, because a later same-ID arrival could execute after that
+rejection. A never-admitted ID has no completed operation to replay and may be
+admitted later. Polling continues so retained IDs can still recover at capacity. Results exceeding the
+4 MiB host transport limit, or failing serialization, produce an explicit
+outcome-unknown response; the operation may already have executed. Temporary
+serialization buffers and request arguments are not included in this result-byte
+budget. No mailbox payloads or recovery records are persisted to disk.
+
+Acknowledged entries expire five minutes after their first acknowledgement.
+Unacknowledged entries do not expire or get evicted to admit new work; a full
+cache applies backpressure. A permanently unavailable original host can therefore
+leave unresolved entries until extension restart. Restart clears recovery state,
+so reconcile mailbox state before repeating uncertain mutations. The endpoint
+and token are immutable constants for the background process, not runtime
+settings; recovery payloads are sent only to that original configured endpoint.
+This is not durable exactly-once execution: restart/crash, retention expiry,
+and genuinely new IDs are outside the deduplication guarantee.
+
+SuperCLI's host acknowledges an identical repeated result for a recently completed
+ID (up to 256 SHA-256 digests, five-minute window). A conflicting result receives
+409 and an unknown/expired ID receives 404. A late result after the caller has
+timed out may therefore be unacknowledged. The host removes cancelled queued
+requests before dispatch; after dispatch a timeout/cancellation is reported as
+outcome unknown with the request ID and a warning against automatic mutation
+retries. An HTTP acknowledgement means the host accepted the result, not that a
+caller definitely displayed it. Neither host nor extension can infer that a
+mailbox operation failed just because its caller stopped waiting.
