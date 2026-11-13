@@ -4,6 +4,9 @@
 
 - Contact imports now deduplicate within the selected destination book, so a dedicated book can remain complete even when an address already exists in another book.
 - Added an explicitly confirmed `update_contact` operation for correcting a contact name or email address.
+- Includes the mutation-scope hardening from `main`: mutating operations (now including `copy` and the address-book operations) require the JSON boolean `confirm: true`, ambiguous account/folder/special-folder selectors fail closed, `to`/`recipient`/`address` are valid mutation filters, continuations are bound to the resolved destination, and `empty_trash`/`purge` no longer report unconfirmed server deletion as verified.
+- Includes result-delivery recovery from `main`: results are serialized once and only delivery is retried; duplicate request IDs never execute twice.
+- Fixed double-encoded Polish error messages in the address-book and Gmail All Mail copy guards.
 
 ## 0.9.31
 
