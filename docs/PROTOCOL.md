@@ -1,6 +1,6 @@
 # Thunderbird AI Bridge protocol
 
-This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.32` implementation.
+This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.33` implementation.
 
 ## Transport
 

@@ -1,6 +1,6 @@
 {
   "name": "thunderbird-ai-bridge",
-  "version": "0.9.32",
+  "version": "0.9.33",
   "private": true,
   "description": "Local Thunderbird bridge for AI agents, CLIs and automation tools.",
   "scripts": {

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.32 - 2026-11-13
+## 0.9.33 - 2026-11-13
 
 ### Fixed after live testing (2026-11-13)
 

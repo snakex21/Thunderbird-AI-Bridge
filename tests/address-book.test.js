@@ -36,7 +36,7 @@ const books = [{
 }];
 
 const messenger = {
-  runtime: { getManifest: () => ({ version: "0.9.32" }) },
+  runtime: { getManifest: () => ({ version: "0.9.33" }) },
   accounts: { list: async () => [account] },
   folders: { query: async () => [inbox] },
   messages: {
