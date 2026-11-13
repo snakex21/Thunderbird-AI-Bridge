@@ -1026,9 +1026,25 @@ async function executeRequest(request) {
   if (op === "folders") {
     const account = await resolveAccount(args);
     const folders = await messenger.folders.query({ accountId: account.id });
+    const getFolderInfo = messenger.folders.getFolderInfo;
+    // Message counters come from Thunderbird's folder database; null when the
+    // API is missing (older Thunderbird) or a single folder cannot be read.
+    const listed = await mapWithConcurrency(folders, 8, async folder => {
+      let info = null;
+      if (typeof getFolderInfo === "function") {
+        try { info = await messenger.folders.getFolderInfo(folder.id || folder); } catch (_) { info = null; }
+      }
+      const count = value => (Number.isFinite(Number(value)) && value !== null && value !== undefined ? Number(value) : null);
+      return {
+        ...plainFolder(folder),
+        totalMessageCount: count(info?.totalMessageCount),
+        unreadMessageCount: count(info?.unreadMessageCount),
+      };
+    });
     return {
       account: { id: account.id, name: account.name, type: account.type },
-      folders: folders.map(plainFolder),
+      folderInfoAvailable: typeof getFolderInfo === "function",
+      folders: listed,
     };
   }
 
