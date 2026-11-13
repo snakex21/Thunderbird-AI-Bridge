@@ -1122,10 +1122,16 @@ async function executeRequest(request) {
         },
       };
     }
-    const enriched = await Promise.all(messages.map((message) => plainMessageWithAttachments(message)));
+    // Listing attachments costs one MIME parse per message (100 results took
+    // 20-27 s live), so search returns headers only unless asked explicitly.
+    const includeAttachments = args.include_attachments === true || args.includeAttachments === true;
+    const enriched = includeAttachments
+      ? await mapWithConcurrency(messages, 6, message => plainMessageWithAttachments(message))
+      : messages.map(plainMessage);
     return {
       account: { id: account.id, name: account.name, type: account.type },
       count: enriched.length,
+      attachmentsIncluded: includeAttachments,
       messages: enriched,
     };
   }
