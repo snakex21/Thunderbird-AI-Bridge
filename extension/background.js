@@ -77,6 +77,60 @@ function isGmailAllMailFolder(account, folder) {
   return specialUse.includes("archives") && (path.includes("[gmail]") || String(account?.name || "").toLowerCase().includes("gmail"));
 }
 
+function isGmailAccount(account, folders = []) {
+  if (String(account?.type || "").toLowerCase() !== "imap") return false;
+  if (/gmail|googlemail/.test(String(account?.name || "").toLowerCase())) return true;
+  if ((account?.identities || []).some(identity => /@(gmail|googlemail)\.com$/i.test(String(identity?.email || "").trim()))) return true;
+  return folders.some(folder => /^\/?\[(gmail|google mail)\]/i.test(String(folder?.path || "")));
+}
+
+function folderHasSpecialUse(folder, ...uses) {
+  const specialUse = Array.isArray(folder?.specialUse) ? folder.specialUse.map(value => String(value).toLowerCase()) : [];
+  return uses.some(use => specialUse.includes(use));
+}
+
+// In Gmail a label folder is only a view of one message. Trashing it from a
+// label (or moving it away) acts on the message itself, so a copy that also
+// sits in Inbox or another label would disappear from there too. Inbox,
+// Trash, Spam and All Mail sources are handled elsewhere.
+async function assertGmailLabelSourceSafe(op, account, source, messages) {
+  const folders = await messenger.folders.query({ accountId: account.id });
+  if (!isGmailAccount(account, folders)) return;
+  if (folderHasSpecialUse(source, "inbox", "trash", "junk") || isGmailAllMailFolder(account, source)) return;
+  const ignored = new Set(folders
+    .filter(folder => folderHasSpecialUse(folder, "trash", "junk") || isGmailAllMailFolder(account, folder))
+    .map(folder => folder.id));
+  ignored.add(source.id);
+  const conflicts = [];
+  let missingMessageId = 0;
+  await mapWithConcurrency(messages, 4, async message => {
+    const key = String(message?.headerMessageId || "").trim().replace(/^<|>$/g, "");
+    if (!key) {
+      missingMessageId++;
+      return;
+    }
+    const first = await messenger.messages.query({ accountId: account.id, headerMessageId: key });
+    const copies = await allMessagePages(first, Infinity);
+    const other = copies.find(copy => copy?.folder?.id && !ignored.has(copy.folder.id));
+    if (other) conflicts.push({ key, folder: other.folder.path || other.folder.name || other.folder.id });
+  });
+  if (!conflicts.length && !missingMessageId) return;
+  const action = op === "trash"
+    ? "przeniesienie do Kosza usunęłoby ją również z Odebranych i pozostałych etykiet"
+    : "przeniesienie usunęłoby ją z etykiety źródłowej, a przy błędnej synchronizacji także oryginał z innych etykiet";
+  const examples = conflicts.slice(0, 3).map(item => `${item.key} → ${item.folder}`).join(", ");
+  throw new Error(
+    `Operacja ${op} z etykiety Gmail "${source.name || source.path}" jest zablokowana: ` +
+    (conflicts.length
+      ? `${conflicts.length} z ${messages.length} wiadomości występuje także w Odebranych lub innej etykiecie (${examples}${conflicts.length > 3 ? ", ..." : ""}). `
+      : "") +
+    (missingMessageId ? `${missingMessageId} wiadomości nie ma nagłówka Message-ID, więc nie da się sprawdzić innych etykiet. ` : "") +
+    `W Gmailu etykiety to widoki tej samej wiadomości, więc ${action}. ` +
+    "Wiadomości pozostawiono bez zmian. Wykonaj operację z folderu Odebrane (INBOX) albo zawęź wybór do wiadomości, które są tylko w tej etykiecie" +
+    (op === "move" ? "; jeśli celem jest wyłącznie zdjęcie tej etykiety, powtórz move z allow_other_labels:true." : ".")
+  );
+}
+
 function trashCountsMeetRequired(actualCounts, requiredCounts) {
   return [...requiredCounts].every(([key, count]) =>
     (actualCounts.get(key) || 0) >= count
@@ -581,6 +635,19 @@ async function mutationMessages(args = {}, defaultFolder = "inbox", allowWholeFo
   const more = candidates.length > batchSize;
   const messages = more ? candidates.slice(0, batchSize) : candidates;
   return { account, source, scoped, messages, batchSize, more };
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function inChunks(items, size, fn) {
@@ -1199,6 +1266,10 @@ async function executeRequest(request) {
       );
     }
 
+    if (args.allow_other_labels !== true) {
+      await assertGmailLabelSourceSafe("move", account, source, messages);
+    }
+
     const state = takeBulkState("move", args, account, source, destination);
     const ids = messages.map((message) => message.id);
     if (args.dry_run === true) {
@@ -1339,6 +1410,7 @@ async function executeRequest(request) {
         throw new Error("Jawnie zatwierdzone usuwanie z Gmail All Mail wymaga dokładnie jednej znalezionej wiadomości dla każdego Message-ID. Przerwano bez zmian.");
       }
     }
+    await assertGmailLabelSourceSafe("trash", account, source, messages);
     const state = takeBulkState("trash", args, account, source, trash);
     const ids = messages.map((message) => message.id);
     const expectedCounts = new Map();
