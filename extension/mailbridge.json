@@ -53,6 +53,27 @@
         "returns": {"type": "boolean"}
       },
       {
+        "name": "repairFolder",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "accountId", "type": "string"},
+          {"name": "path", "type": "string"}
+        ],
+        "returns": {
+          "type": "object",
+          "properties": {
+            "error": {"type": "string"},
+            "busy": {"type": "boolean"},
+            "started": {"type": "boolean"},
+            "completed": {"type": "boolean"},
+            "beforeTotal": {"type": "number"},
+            "afterTotal": {"type": "number"},
+            "offlineStoreRemoved": {"type": "boolean"}
+          }
+        }
+      },
+      {
         "name": "deleteFolderAndRefresh",
         "type": "function",
         "async": true,

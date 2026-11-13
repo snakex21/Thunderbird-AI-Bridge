@@ -82,6 +82,37 @@ async function waitForDirectChild(parent, name, shouldExist, label, getOperation
   }
 }
 
+function folderShownInMailTab(folder) {
+  try {
+    for (const win of Services.wm.getEnumerator("mail:3pane")) {
+      const tabmail = win.document.getElementById("tabmail");
+      for (const tab of tabmail?.tabInfo || []) {
+        let shown = null;
+        try { shown = tab.folder || tab.chromeBrowser?.contentWindow?.gFolder || null; } catch (_) {}
+        if (shown && shown.URI === folder.URI) return true;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
+function repairResult(fields) {
+  return {
+    error: "",
+    busy: false,
+    started: false,
+    completed: false,
+    beforeTotal: -1,
+    afterTotal: -1,
+    offlineStoreRemoved: false,
+    ...fields,
+  };
+}
+
+function folderTotal(folder) {
+  try { return Number(folder.getTotalMessages(false)); } catch (_) { return -1; }
+}
+
 var mailbridge = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     return {
@@ -234,6 +265,120 @@ var mailbridge = class extends ExtensionCommon.ExtensionAPI {
             await new Promise(resolve => setTimeout(resolve, 1500));
           }
           return true;
+        },
+
+        // The same steps as Folder Properties > Repair Folder
+        // (about3Pane.js rebuildSummary): drop the local index (.msf) and,
+        // for IMAP, the local offline cache, then let Thunderbird rebuild
+        // them from the server (IMAP) or by reparsing the mbox (local).
+        // Server messages and local mbox contents are never deleted. Every
+        // precondition refuses before anything is touched.
+        async repairFolder(accountId, path) {
+          const name = path;
+          try {
+            const folder = context.extension.folderManager.get(accountId, path);
+            if (!folder) {
+              return repairResult({ error: `Nie znaleziono natywnego folderu Thunderbird: ${accountId} ${path}` });
+            }
+            const label = folder.localizedName || folder.name || name;
+            if (folder.isServer || !folder.parent) {
+              return repairResult({ error: "Folderu głównego konta nie można naprawić przez bridge." });
+            }
+            if (folder.getFlag(Components.interfaces.nsMsgFolderFlags.Virtual)) {
+              return repairResult({ error: `Folder „${label}” to wyszukiwanie zapisane; nie ma czego naprawiać.` });
+            }
+            if (Services.io.offline) {
+              return repairResult({ busy: true, error: "Thunderbird pracuje w trybie offline; naprawa folderu wymaga połączenia z serwerem. Nic nie zmieniono — przełącz Thunderbirda w tryb online i spróbuj ponownie." });
+            }
+            if (folder.locked) {
+              return repairResult({
+                busy: true,
+                error: `Folder „${label}” jest zajęty: inny proces ma do niego dostęp (Thunderbird właśnie pobiera, przenosi, kompaktuje lub indeksuje wiadomości). ` +
+                  "Naprawa nie została uruchomiona i nic nie zmieniono — spróbuj ponownie za kilka minut.",
+              });
+            }
+            let pendingOfflineOps = 0;
+            try {
+              const db = folder.msgDatabase;
+              if (db && typeof db.listAllOfflineOpIds === "function") pendingOfflineOps = db.listAllOfflineOpIds().length;
+            } catch (_) {}
+            if (pendingOfflineOps > 0) {
+              return repairResult({
+                busy: true,
+                error: `Folder „${label}” ma ${pendingOfflineOps} niewysłanych operacji offline; naprawa mogłaby je utracić. ` +
+                  "Nic nie zmieniono — poczekaj, aż Thunderbird zsynchronizuje folder, i spróbuj ponownie później.",
+              });
+            }
+            if (folderShownInMailTab(folder)) {
+              return repairResult({
+                busy: true,
+                error: `Folder „${label}” jest otwarty w karcie Thunderbirda. Nic nie zmieniono — przełącz widok na inny folder i spróbuj ponownie.`,
+              });
+            }
+            let store = null;
+            try { store = folder.supportsOffline ? folder.filePath : null; } catch (_) { store = null; }
+            if (store && store.exists() && store.isDirectory()) {
+              return repairResult({
+                error: `Folder „${label}” używa magazynu maildir; bridge naprawia tylko magazyn mbox. Nic nie zmieniono — użyj Właściwości folderu > Napraw folder w Thunderbirdzie.`,
+              });
+            }
+
+            const beforeTotal = folderTotal(folder);
+            let offlineStoreRemoved = false;
+            if (store && store.exists()) {
+              // Local copy of server messages only; the server keeps them.
+              store.remove(false);
+              offlineStoreRemoved = true;
+            }
+            MailServices.mfn.notifyFolderReindexTriggered(folder);
+            const db = folder.msgDatabase;
+            db.summaryValid = false;
+            try {
+              folder.closeAndBackupFolderDB("");
+            } catch (_) {
+              folder.ForceDBClosed();
+            }
+
+            let completed = true;
+            let rebuildError = "";
+            const imap = folder.server?.type === "imap";
+            if (imap && typeof folder.updateFolderWithListener === "function") {
+              try {
+                await runFolderUrl(
+                  listener => folder.updateFolderWithListener(null, listener),
+                  "przebudowy indeksu folderu",
+                  5 * 60 * 1000
+                );
+              } catch (error) {
+                completed = false;
+                rebuildError = String(error?.message || error);
+              }
+            } else {
+              folder.updateFolder(null);
+            }
+            // A local mbox reparse runs asynchronously while the folder is locked.
+            const deadline = Date.now() + 5 * 60 * 1000;
+            for (;;) {
+              let locked = false;
+              try { locked = folder.locked; } catch (_) {}
+              if (!locked) break;
+              if (Date.now() >= deadline) {
+                completed = false;
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            return repairResult({
+              started: true,
+              completed,
+              beforeTotal,
+              afterTotal: folderTotal(folder),
+              offlineStoreRemoved,
+              error: rebuildError,
+            });
+          } catch (error) {
+            return repairResult({ error: describeExperimentError(error) });
+          }
         },
 
         async deleteFolderAndRefresh(accountId, path) {

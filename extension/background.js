@@ -1074,6 +1074,7 @@ async function executeRequest(request) {
       extensionVersion: messenger.runtime.getManifest().version,
       nativeExpungeAvailable: Boolean(messenger.mailbridge && messenger.mailbridge.compactAndRefresh),
       nativeEmptyTrashAvailable: Boolean(messenger.mailbridge && messenger.mailbridge.emptyTrashAndRefresh),
+      nativeRepairFolderAvailable: Boolean(messenger.mailbridge && messenger.mailbridge.repairFolder),
       attachmentMetadataAvailable: Boolean(messenger.messages && messenger.messages.listAttachments),
       attachmentContentAvailable: Boolean(messenger.messages && messenger.messages.getAttachmentFile),
       messageBodyAvailable: Boolean(messenger.messages && (messenger.messages.listInlineTextParts || messenger.messages.getFull)),
@@ -1259,6 +1260,51 @@ async function executeRequest(request) {
       afterExpungedBytes: Number(measurement?.afterExpungedBytes) || 0,
       skipped: measurement?.skipped === true,
       messagesChanged: false,
+    };
+  }
+
+  if (op === "repair_folder") {
+    if (args.confirm !== true) throw new Error("repair_folder wymaga confirm:true po wyraźnej zgodzie użytkownika.");
+    const account = await resolveAccount(args);
+    const folder = await resolveFolder(account, args.folder);
+    if (!folder || folder.path === "/") throw new Error("repair_folder wymaga konkretnego folderu (nie folderu głównego konta).");
+    if (isGmailAllMailFolder(account, folder) && args.allow_all_mail !== true) {
+      throw new Error(
+        "Naprawa Gmail All Mail/Wszystkie jest zablokowana domyślnie: Thunderbird pobierze ponownie nagłówki i kopię offline całej skrzynki. " +
+        "Nic nie zmieniono. Napraw konkretną etykietę albo powtórz z allow_all_mail:true."
+      );
+    }
+    if (!messenger.mailbridge?.repairFolder) {
+      throw new Error("Natywna naprawa folderu jest niedostępna. Zaktualizuj bridge i uruchom ponownie Thunderbirda.");
+    }
+    const measure = async () => {
+      try {
+        const first = await messenger.messages.query({ accountId: account.id, folderId: folder.id });
+        const records = await allMessagePages(first, Infinity);
+        const unique = dedupeMessagesByMessageId(account, records, false);
+        return { records: records.length, uniqueMessages: unique.messages.length, duplicateRecords: unique.duplicateRecords };
+      } catch (_) {
+        return null;
+      }
+    };
+    const before = await measure();
+    const native = await messenger.mailbridge.repairFolder(folder.accountId, folder.path);
+    if (!native?.started) {
+      throw new Error(native?.error || "Thunderbird nie uruchomił naprawy folderu. Nic nie zmieniono.");
+    }
+    const after = await measure();
+    return {
+      account: { id: account.id, name: account.name, type: account.type },
+      folder: plainFolder(folder),
+      repaired: native.completed === true && !native.error,
+      completed: native.completed === true,
+      rebuildError: native.error || undefined,
+      offlineStoreRemoved: native.offlineStoreRemoved === true,
+      before,
+      after,
+      messagesDeleted: false,
+      warning: native.completed === true && !native.error ? undefined :
+        "Thunderbird nadal przebudowuje indeks folderu. Wiadomości nie zostały usunięte; sprawdź folder (count / folders z include_unique_counts) za kilka minut.",
     };
   }
 
@@ -2131,12 +2177,12 @@ const READ_OPERATION_TIMEOUT_MS = 120 * 1000;
 const MUTATION_OPERATION_TIMEOUT_MS = 10 * 60 * 1000;
 const LONG_MUTATION_TIMEOUT_MS = 20 * 60 * 1000;
 const MUTATING_OPERATIONS = new Set([
-  "create_folder", "rename_folder", "delete_folder", "compact_folder", "create_address_book", "add_contacts",
+  "create_folder", "rename_folder", "delete_folder", "compact_folder", "repair_folder", "create_address_book", "add_contacts",
   "update_contact", "import_msg", "move", "copy", "trash", "restore", "empty_trash", "purge", "delete_permanently",
 ]);
 
 function operationTimeoutMs(op) {
-  if (op === "compact_folder" || op === "empty_trash") return LONG_MUTATION_TIMEOUT_MS;
+  if (op === "compact_folder" || op === "empty_trash" || op === "repair_folder") return LONG_MUTATION_TIMEOUT_MS;
   return MUTATING_OPERATIONS.has(op) ? MUTATION_OPERATION_TIMEOUT_MS : READ_OPERATION_TIMEOUT_MS;
 }
 
