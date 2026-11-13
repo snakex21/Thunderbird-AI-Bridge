@@ -44,7 +44,7 @@ Request envelope:
 
 ### `POST /result?token=...`
 
-The extension posts the completed result as JSON.
+The extension posts the completed result as JSON with `Content-Type: application/json; charset=utf-8`. The body is always valid UTF-8: Polish text in results and error messages is sent as-is, and a lone UTF-16 surrogate (e.g. from a broken subject) is escaped as `\udXXX`. Hosts should decode the body as UTF-8.
 
 Success:
 
@@ -103,6 +103,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `attachments`
 - `get_attachment`
 - `largest`
+- `verify_move`
 - `address_books`
 - `contacts`
 - `contact_candidates`
@@ -113,6 +114,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `rename_folder`
 - `delete_folder`
 - `compact_folder`
+- `repair_folder`
 - `create_address_book`
 - `add_contacts`
 - `update_contact`
@@ -155,6 +157,7 @@ Depending on the operation, the bridge accepts:
 - `message_ids` — mutations only: up to 100 exact numeric Thunderbird message IDs (from `search`); every ID must still be in the selected source folder or the operation aborts without changes. Use this when Gmail holds several records with one `Message-ID`.
 - `local_backup_verified` — `trash` only: JSON `true` together with exact `message_ids`/`header_message_ids` and no other filters allows a Gmail All Mail cleanup after the host has verified a local backup. Every selected `Message-ID` must resolve to exactly one message.
 - `allow_other_labels` — `move` only, see Gmail label safety
+- `include_duplicates` — `count`, `search`, `senders`, `largest`: JSON `true` returns one entry per Thunderbird record instead of one per `Message-ID` (see Duplicate messages)
 
 Example:
 
@@ -179,6 +182,13 @@ Account and folder selectors must be unambiguous. Automatic Inbox/Trash resoluti
 **Domain filters.** `from`, `to` and `address` accept a domain. `@example.com` matches only mailboxes at `example.com` or a subdomain (`mail.example.com`), case-insensitively. A bare `example.com` matches the same mailboxes and also a display name containing that text. `notexample.com` and `example.com.evil.org` do not match. The extension matches domains against the parsed mailbox (`to` covers To and Cc), because Thunderbird's own query only matches full addresses or names. This applies to `search`, `count`, `senders`, `largest`, `contact_candidates` and bulk mutation selection (`move`, `copy`, `trash`, `restore`, `purge`). A domain filter scans all headers in the selected folder, so keep the default Inbox scope or add dates where possible.
 
 **Ordering.** `search` results are always newest-first (message date descending, then Thunderbird ID descending), for plain, `address` and domain searches alike. A limited search scans all matching headers and returns the newest `limit`. Bulk mutations select batches in Thunderbird's folder order.
+
+**Duplicate messages.** `count`, `search`, `senders` and `largest` count each `Message-ID` once:
+
+- within one folder, duplicate index records of the same message (Thunderbird keeps them after some IMAP moves; seen live as 75 records for 67 messages) are merged, keeping the record with the highest Thunderbird ID;
+- on Gmail, where a message appears once per label plus All Mail, an account-wide (or multi-folder) scan counts it once and returns a label copy rather than the All Mail copy. Other servers keep the same `Message-ID` in different folders as real copies.
+
+Messages without a `Message-ID` are never merged. Results include `deduplicatedByMessageId: true`, `crossFolderDeduplication` (Gmail), `scannedRecords`, `duplicatesSkipped` (total), `duplicateRecords` (same folder) and `crossFolderDuplicates` (Gmail labels). `search` deduplicates before applying `limit`. Pass `include_duplicates: true` for the raw per-record behaviour (`deduplicatedByMessageId: false`). Bulk mutations always select every record.
 
 **Account selection.** When `account` is omitted:
 
@@ -220,11 +230,13 @@ The extension uploads the attachment to `/attachment-file` and returns a `transf
 
 System/root folders are protected from rename/delete actions.
 
-`folders` returns `totalMessageCount` and `unreadMessageCount` for each folder from `messenger.folders.getFolderInfo`, plus `folderInfoAvailable`. Counts are `null` when the API is missing or one folder cannot be read; the listing itself does not fail.
+`folders` returns `totalMessageCount` and `unreadMessageCount` for each folder from `messenger.folders.getFolderInfo`, plus `folderInfoAvailable`. Counts are `null` when the API is missing or one folder cannot be read; the listing itself does not fail. `totalMessageCount` counts index records and can include duplicate records of one message. `include_unique_counts: true` scans headers and adds `messageRecords`, `uniqueMessageCount` and `duplicateRecords` per folder (or only for the folder given in `folder`). This is opt-in because it reads every header, which is slow on a large Gmail All Mail. The result says `uniqueCountsIncluded`.
+
+`repair_folder` requires `folder` and `confirm: true`. It does what Folder Properties > Repair Folder does in Thunderbird: for IMAP it removes the local offline cache file (messages stay on the server), invalidates and backs up the folder index (`.msf`) and rebuilds it from the server; for a local mbox folder it reparses the mbox. Messages are never deleted. It is refused before anything changes, with a Polish error, when the folder is busy ("inny proces ma do niego dostęp", retry in a few minutes), Thunderbird is offline, the folder has pending offline operations, the folder is open in a Thunderbird tab, or it is a saved search, a maildir store or the account root. Gmail All Mail needs `allow_all_mail: true`. The result has `repaired`, `completed`, `offlineStoreRemoved`, `before`/`after` (`records`, `uniqueMessages`, `duplicateRecords`) and `messagesDeleted: false`. When Thunderbird is still rebuilding after 5 minutes it returns `completed: false` with a `warning`; re-check later with `count` or `folders`. `status.nativeRepairFolderAvailable` tells whether the experiment is present.
 
 `delete_folder` returns `deleted: true, movedToTrash: false` when the folder is gone. On Local Folders (and servers that behave the same way) Thunderbird moves the folder into Trash instead; the result is then `deleted: false, movedToTrash: true` with `newPath` and `trashedFolder`.
 
-`largest` on a Gmail account counts each `Message-ID` once (a labelled copy is preferred over All Mail) and returns `deduplicatedByMessageId: true` and `duplicatesSkipped`. Other servers keep real duplicate copies.
+`largest` counts each `Message-ID` once as described under Duplicate messages.
 
 `compact_folder` requires `folder` and `confirm: true`. It invokes Thunderbird's native compaction for one folder, skips work when Thunderbird reports no expunged bytes, and returns `beforeBytes`, `afterBytes`, `reclaimedBytes`, `beforeExpungedBytes`, `afterExpungedBytes`, `skipped` and `messagesChanged: false`. It is intended as occasional maintenance after a cleanup, not after every mutation batch.
 
@@ -250,7 +262,11 @@ The host should send the returned continuation token with the same operation and
 1. checks that each moved `Message-ID` is in the destination and that the original IDs left the source (up to 15 s);
 2. waits a settle window (10 s on Gmail, 5 s on other IMAP, none for Local Folders), asks Thunderbird to refresh both folders from the server (`mailbridge.refreshFolder`, skipped if unavailable) and checks again.
 
-The result includes `verified`, `immediateVerified`, `destinationVerified`, `sourceVerified`, `settleMs`, `refreshed`, `movedButUnverified`, `missingInDestination` (up to 20 Message-IDs), `destinationDuplicates`, `status` (`verified_moved` or `moved_but_unverified`) and `warning`. On Gmail, a destination label that already held the message only has to contain it; elsewhere each moved message must add a copy. An unverified batch returns no `continuation` even when `more: true`; check the destination and All Mail before continuing. Gmail can still drop a label later than the settle window, so hosts that need certainty should re-check with `search` after a few minutes.
+The result includes `verified`, `immediateVerified`, `destinationVerified`, `sourceVerified`, `settleMs`, `refreshed`, `movedButUnverified`, `missingInDestination` (up to 20 Message-IDs), `destinationDuplicates`, `status` (`verified_moved` or `moved_but_unverified`) and `warning`. On Gmail, a destination label that already held the message only has to contain it; elsewhere each moved message must add a copy. An unverified batch returns no `continuation` even when `more: true`; check the destination and All Mail before continuing.
+
+Gmail can still drop a label later than the settle window. IMAP move results therefore also include `messageIds` (the moved `Message-ID`s), `recheckAfterMs` (180000 on Gmail, 60000 on other IMAP, `null` for Local Folders) and `recheck`, a ready request `{op: "verify_move", args: {account, source, destination, header_message_ids}}`. Hosts should send it after `recheckAfterMs`, with a new request `id`.
+
+`verify_move` is read-only. Arguments: `destination` (required), `header_message_ids` (required, up to 500), optional `source`, `account`, and `refresh` (default `true`: ask Thunderbird to refresh both folders from the server first). It returns `checked`, `inDestination`, `missingInDestinationCount`, `stillInSourceCount`, `missingInDestination`, `stillInSource`, `destinationDuplicates` (up to 50 each), `locations` (for up to 20 missing IDs: `foundIn` folder paths, `onlyInAllMail` when Gmail dropped the label, and `notFound`), `labelDropped`, `refreshed`, `verified`, `status` (`verified_moved` / `moved_but_unverified`), `readOnly: true` and a Polish `warning` when unverified.
 
 ### Gmail label safety
 
@@ -283,7 +299,7 @@ The protocol is experimental until `1.0`. If you build another host implementati
 
 ### Operation timeouts
 
-The extension limits how long it waits for one operation: 120 s for reads, 10 minutes for mutations, 20 minutes for `compact_folder` and `empty_trash`. A timeout cannot stop Thunderbird's own work. A timed-out mutation returns `ok: false` with an error containing `outcome unknown` (it may have executed or still be running; do not retry automatically). A timed-out read says nothing changed. The extension logs a `console.warn` with the operation name and continues with the next request, so a later operation may run while a timed-out one is still finishing. Hosts usually time out earlier (SuperCLI: 20–120 s) and must treat that as outcome unknown too.
+The extension limits how long it waits for one operation: 120 s for reads, 10 minutes for mutations, 20 minutes for `compact_folder`, `empty_trash` and `repair_folder`. A timeout cannot stop Thunderbird's own work. A timed-out mutation returns `ok: false` with an error containing `outcome unknown` (it may have executed or still be running; do not retry automatically). A timed-out read says nothing changed. The extension logs a `console.warn` with the operation name and continues with the next request, so a later operation may run while a timed-out one is still finishing. Hosts usually time out earlier (SuperCLI: 20–120 s) and must treat that as outcome unknown too.
 
 ### Delivery
 
