@@ -12,7 +12,7 @@ It is **not tied to one AI model, one CLI or one cloud provider**. The Thunderbi
 
 The project is designed for local-first use: Thunderbird talks to `127.0.0.1`, so mailbox access does not need to be exposed directly to the network.
 
-> Status: experimental, currently based on the working `0.9.21` bridge. The protocol may still change before `1.0`.
+> Status: experimental, currently based on the working `0.9.32` bridge. The protocol may still change before `1.0`.
 
 ## Why this exists
 
@@ -36,6 +36,7 @@ That means one bridge can potentially be used by:
 - search messages by sender, recipient/address, subject, full text and date,
 - count matching messages,
 - group messages by sender,
+- list the largest messages with byte sizes and stable Message-ID headers,
 - aggregate contact candidates from senders and recipients without loading message bodies,
 - list address books and contacts,
 - create a dedicated local address book and import explicitly approved contacts with per-book email deduplication,
@@ -45,7 +46,8 @@ That means one bridge can potentially be used by:
 - list attachment metadata,
 - transfer attachment contents to the local host for vision/document processing,
 - move messages between folders,
-- move messages to Trash,
+- copy messages to another folder or account with Message-ID verification (retry-safe, no duplicates),
+- move messages to Trash with settled source/Trash verification (Gmail All Mail is guarded),
 - restore messages from Trash,
 - permanently delete messages from Trash with verification,
 - use Thunderbird's native IMAP EXPUNGE/Empty Trash behavior,

@@ -1,6 +1,6 @@
 # Thunderbird AI Bridge protocol
 
-This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.21` implementation.
+This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.32` implementation.
 
 ## Transport
 
@@ -91,6 +91,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `read`
 - `attachments`
 - `get_attachment`
+- `largest`
 - `address_books`
 - `contacts`
 - `contact_candidates`
@@ -106,6 +107,7 @@ Keep the host bound to loopback. Endpoint/token configuration and generated per-
 - `update_contact`
 - `import_msg`
 - `move`
+- `copy`
 - `trash`
 - `restore`
 - `empty_trash`
