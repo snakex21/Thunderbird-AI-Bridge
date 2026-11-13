@@ -140,3 +140,23 @@ test("mutation selection still sees every record", async () => {
   const result = await f.run("move", { confirm: true, folder: "studia", destination: "Odebrane", subject: "temat", dry_run: true, batch_size: 10 });
   assert.equal(result.wouldProcess, 6);
 });
+
+test("folders reports uniqueMessageCount and duplicateRecords only when asked", async () => {
+  const f = fixture({ accountName: "Firma", messages: [...studiaMessages(), msg(20, "q@uczelnia.test", inbox)] });
+  const plain = await f.run("folders", {});
+  assert.equal(plain.uniqueCountsIncluded, false);
+  assert.equal(plain.folders[1].uniqueMessageCount, undefined);
+  assert.equal(f.queries.length, 0, "the default listing scans no headers");
+
+  const all = await f.run("folders", { include_unique_counts: true });
+  const byPath = Object.fromEntries(Array.from(all.folders, item => [item.path, item]));
+  assert.equal(byPath["/studia"].messageRecords, 6);
+  assert.equal(byPath["/studia"].uniqueMessageCount, 3);
+  assert.equal(byPath["/studia"].duplicateRecords, 3);
+  assert.equal(byPath["/INBOX"].uniqueMessageCount, 1);
+
+  const one = await f.run("folders", { include_unique_counts: true, folder: "studia" });
+  const onePaths = Object.fromEntries(Array.from(one.folders, item => [item.path, item]));
+  assert.equal(onePaths["/studia"].uniqueMessageCount, 3);
+  assert.equal(onePaths["/INBOX"].uniqueMessageCount, undefined, "only the requested folder is scanned");
+});

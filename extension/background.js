@@ -1110,6 +1110,12 @@ async function executeRequest(request) {
     const account = await resolveAccount(args);
     const folders = await messenger.folders.query({ accountId: account.id });
     const getFolderInfo = messenger.folders.getFolderInfo;
+    // totalMessageCount counts index records and can include duplicate
+    // records of one message. Unique counts need a header scan of the folder,
+    // so they are opt-in (include_unique_counts:true), optionally for one
+    // folder only.
+    const uniqueCounts = args.include_unique_counts === true || args.includeUniqueCounts === true;
+    const uniqueOnly = uniqueCounts && String(args.folder || "").trim() ? await resolveFolder(account, args.folder) : null;
     // Message counters come from Thunderbird's folder database; null when the
     // API is missing (older Thunderbird) or a single folder cannot be read.
     const listed = await mapWithConcurrency(folders, 8, async folder => {
@@ -1118,15 +1124,29 @@ async function executeRequest(request) {
         try { info = await messenger.folders.getFolderInfo(folder.id || folder); } catch (_) { info = null; }
       }
       const count = value => (Number.isFinite(Number(value)) && value !== null && value !== undefined ? Number(value) : null);
-      return {
+      const item = {
         ...plainFolder(folder),
         totalMessageCount: count(info?.totalMessageCount),
         unreadMessageCount: count(info?.unreadMessageCount),
       };
+      if (uniqueCounts && (!uniqueOnly || uniqueOnly.id === folder.id)) {
+        try {
+          const first = await messenger.messages.query({ accountId: account.id, folderId: folder.id });
+          const records = await allMessagePages(first, Infinity);
+          const unique = dedupeMessagesByMessageId(account, records, false);
+          item.messageRecords = records.length;
+          item.uniqueMessageCount = unique.messages.length;
+          item.duplicateRecords = unique.duplicateRecords;
+        } catch (_) {
+          item.uniqueMessageCount = null;
+        }
+      }
+      return item;
     });
     return {
       account: { id: account.id, name: account.name, type: account.type },
       folderInfoAvailable: typeof getFolderInfo === "function",
+      uniqueCountsIncluded: uniqueCounts,
       folders: listed,
     };
   }
