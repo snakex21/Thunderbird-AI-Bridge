@@ -1126,6 +1126,8 @@ async function executeRequest(request) {
     if ((folder.specialUse || []).length > 0 || folder.path === "/") throw new Error("Folder systemowy/root nie może być usunięty przez bridge.");
     if (folder.capabilities?.canBeDeleted === false) throw new Error("Thunderbird oznacza ten folder jako nieusuwalny.");
     const before = plainFolder(folder);
+    const foldersBefore = await messenger.folders.query({ accountId: account.id });
+    const idsBefore = new Set(foldersBefore.map(item => item.id));
     if (String(account.type || "").toLowerCase() === "imap") {
       if (!messenger.mailbridge || !messenger.mailbridge.deleteFolderAndRefresh) {
         throw new Error("Natywne usuwanie folderu IMAP jest niedostępne. Zaktualizuj bridge i uruchom ponownie Thunderbirda.");
@@ -1150,9 +1152,33 @@ async function executeRequest(request) {
     if (!deleted) {
       throw new Error(`Thunderbird nie potwierdził usunięcia folderu ${folder.path || folder.name}.`);
     }
+    // Local Folders (and some servers) "delete" a folder by moving it into
+    // Trash. Report where it went instead of claiming deleted:true.
+    let trash = null;
+    try { trash = await resolveSpecialFolder(account, "trash", ["trash", "kosz"]); } catch (_) {}
+    const trashPrefix = trash?.path ? `${String(trash.path).replace(/\/+$/, "")}/` : "";
+    const inTrash = trashPrefix
+      ? remaining.filter(item => !idsBefore.has(item.id) && String(item.path || "").startsWith(trashPrefix))
+      : [];
+    const trashed = inTrash.find(item => item.name === folder.name) ||
+      inTrash.find(item => String(item.name || "").startsWith(String(folder.name || ""))) ||
+      null;
+    if (trashed) {
+      return {
+        account: { id: account.id, name: account.name, type: account.type },
+        deleted: false,
+        movedToTrash: true,
+        newPath: trashed.path,
+        trashedFolder: plainFolder(trashed),
+        serverVerified: String(account.type || "").toLowerCase() === "imap",
+        folder: before,
+        changed: true,
+      };
+    }
     return {
       account: { id: account.id, name: account.name, type: account.type },
       deleted: true,
+      movedToTrash: false,
       serverVerified: String(account.type || "").toLowerCase() === "imap",
       folder: before,
       changed: true,
