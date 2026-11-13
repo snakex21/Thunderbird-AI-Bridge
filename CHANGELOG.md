@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.9.32
+## 0.9.32 - 2026-11-13
+
+### Fixed after live testing (2026-11-13)
+
+- `from`, `to` and `address` filters given as a domain (`example.com` or `@example.com`) returned 0 because Thunderbird's query needs a full address or a name. Domains are now matched locally against the parsed mailbox (exact domain or subdomain, case-insensitive; `to` covers To and Cc) in `search`, `count`, `senders`, `largest`, `contact_candidates` and bulk mutation selection.
+- `search` results are consistently newest-first; a limited search now returns the newest matches instead of the first pages in folder order.
+- `search` no longer lists attachments for every result (100 results took 20–27 s). Pass `include_attachments: true` to get attachment metadata (at most 6 concurrent lookups); `read` still includes it. **Behaviour change for hosts.**
+- Gmail: `trash` or `move` from a label other than Inbox is blocked with a Polish explanation when the same `Message-ID` is also in Inbox or another label, because Gmail would remove it there too. Inbox sources stay allowed; All Mail protection is unchanged; `move` accepts `allow_other_labels: true` for label-only removal.
+- `move` is now verified: right after `messages.move`, then again after a settle window (10 s Gmail, 5 s other IMAP) and a server refresh of both folders (new `mailbridge.refreshFolder` experiment). A batch that does not survive returns `status: "moved_but_unverified"`, `movedButUnverified` and `missingInDestination`, and no continuation token. Duplicate destination headers are reported as a warning.
+- Without `account`, a folder ID like `account2://INBOX` selects its own account, and a folder name that exists on several mail accounts is an error instead of silently using the first IMAP account. Account names match exactly (case-insensitive) before substring.
+- Each operation has a time limit in the extension (120 s reads, 10 min mutations, 20 min `compact_folder`/`empty_trash`). A timed-out mutation reports `outcome unknown`; the request worker continues with later requests.
+- When the result cache is full the host now receives an explicit `ok: false, notExecuted: true` error instead of no answer; the rejected ID is remembered so it never executes later.
+- The poll loop waits 250 ms after an empty `204` instead of polling again immediately.
+- `delete_folder` on Local Folders, where Thunderbird moves the folder into Trash, reports `movedToTrash: true` and `newPath` instead of `deleted: true`.
+- `folders` includes `totalMessageCount` and `unreadMessageCount` from `folders.getFolderInfo` where available.
+- `largest` with `scope: "account"` on Gmail counts each `Message-ID` once, so totals are no longer doubled by labels and All Mail.
+- `PROTOCOL.md` now documents the required host CORS headers and long-poll, `message_ids`, `header_message_ids`, `local_backup_verified` and the new parameters and result fields.
+
+### Earlier in 0.9.32
 
 - Contact imports now deduplicate within the selected destination book, so a dedicated book can remain complete even when an address already exists in another book.
 - Added an explicitly confirmed `update_contact` operation for correcting a contact name or email address.

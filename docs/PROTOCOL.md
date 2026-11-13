@@ -12,6 +12,17 @@ http://127.0.0.1:47831
 
 The extension is the polling side. The host process owns a small request queue and file-transfer storage.
 
+### Host requirements (CORS and long-poll)
+
+The extension runs in Thunderbird's background page, so every host endpoint is a cross-origin request. A host **MUST**:
+
+- send `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS` and `Access-Control-Allow-Headers: Content-Type` on every response (including errors), and
+- answer an `OPTIONS` preflight with `204 No Content` and the same headers.
+
+Without these headers Thunderbird rejects the response and the bridge looks disconnected.
+
+`/poll` **SHOULD** be a long-poll: keep the request open (SuperCLI uses 20 s) until a request is queued, then answer immediately. The extension polls again right after each answer. Since 0.9.32 it waits 250 ms after a `204` before polling again, so a host that answers `204` immediately does not cause a busy loop, but a new request may then wait up to 250 ms before Thunderbird sees it. After a network error the extension waits 1 s.
+
 ### `GET /poll?token=...`
 
 Returns the next queued request as JSON, or HTTP `204 No Content` when no request is waiting.
@@ -137,7 +148,13 @@ Depending on the operation, the bridge accepts:
 - `fullText` / `text`
 - `since` — `YYYY-MM-DD`
 - `until` — `YYYY-MM-DD`
-- `limit`
+- `limit` — `search` returns 1–100 results (default 20)
+- `include_attachments` — `search` only, JSON boolean, default `false` (see Attachments)
+- `header_message_id` — one exact RFC `Message-ID` (angle brackets optional)
+- `header_message_ids` — mutations only: up to 100 exact `Message-ID` values, selected in one local header scan; any missing value aborts without changes
+- `message_ids` — mutations only: up to 100 exact numeric Thunderbird message IDs (from `search`); every ID must still be in the selected source folder or the operation aborts without changes. Use this when Gmail holds several records with one `Message-ID`.
+- `local_backup_verified` — `trash` only: JSON `true` together with exact `message_ids`/`header_message_ids` and no other filters allows a Gmail All Mail cleanup after the host has verified a local backup. Every selected `Message-ID` must resolve to exactly one message.
+- `allow_other_labels` — `move` only, see Gmail label safety
 
 Example:
 
@@ -159,6 +176,18 @@ Account and folder selectors must be unambiguous. Automatic Inbox/Trash resoluti
 
 `address` performs a sender-or-recipient search and overrides `from`/`author` and `to`/`recipient`. Other filters (subject, text and dates) still apply. The same matching semantics apply to bulk mutations.
 
+**Domain filters.** `from`, `to` and `address` accept a domain. `@example.com` matches only mailboxes at `example.com` or a subdomain (`mail.example.com`), case-insensitively. A bare `example.com` matches the same mailboxes and also a display name containing that text. `notexample.com` and `example.com.evil.org` do not match. The extension matches domains against the parsed mailbox (`to` covers To and Cc), because Thunderbird's own query only matches full addresses or names. This applies to `search`, `count`, `senders`, `largest`, `contact_candidates` and bulk mutation selection (`move`, `copy`, `trash`, `restore`, `purge`). A domain filter scans all headers in the selected folder, so keep the default Inbox scope or add dates where possible.
+
+**Ordering.** `search` results are always newest-first (message date descending, then Thunderbird ID descending), for plain, `address` and domain searches alike. A limited search scans all matching headers and returns the newest `limit`. Bulk mutations select batches in Thunderbird's folder order.
+
+**Account selection.** When `account` is omitted:
+
+1. a folder ID such as `account2://INBOX` selects its own account;
+2. with more than one mail account (Local Folders excluded), a friendly folder name that exists on several accounts is an error (`Folder "Inbox" istnieje na kilku kontach ...`); a name found on exactly one account selects that account;
+3. otherwise the first IMAP account is used, as before.
+
+Account names match exactly (case-insensitive) first, then by substring; several substring matches are an error.
+
 ## Reading a message
 
 First obtain `message.id` from `search`, then call:
@@ -175,9 +204,11 @@ First obtain `message.id` from `search`, then call:
 }
 ```
 
-Long messages can be paged using `nextStartChar` returned by the previous call. Reading through this operation does not intentionally change the Thunderbird read/unread state.
+Long messages can be paged using `nextStartChar` returned by the previous call. Reading through this operation does not intentionally change the Thunderbird read/unread state. `read` always includes attachment metadata (`hasAttachments`, `attachmentCount`, `attachments`).
 
 ## Attachments
+
+Since 0.9.32 `search` does **not** list attachments by default: that costs one MIME parse per result (100 results took 20–27 s). The response has `attachmentsIncluded: false`, and its messages have no `hasAttachments`/`attachmentCount`/`attachments` fields. Pass `include_attachments: true` to get those fields (listed with at most 6 concurrent calls), or call `attachments`/`read` for one message.
 
 Use `attachments` to list metadata. Then use `get_attachment` with `message_id` and either `part_name` or an unambiguous `attachment_name`.
 
@@ -188,6 +219,12 @@ The extension uploads the attachment to `/attachment-file` and returns a `transf
 `create_folder`, `rename_folder` and `delete_folder` use Thunderbird APIs plus a native experiment layer for IMAP cases where Thunderbird's high-level extension API needs explicit refresh/verification.
 
 System/root folders are protected from rename/delete actions.
+
+`folders` returns `totalMessageCount` and `unreadMessageCount` for each folder from `messenger.folders.getFolderInfo`, plus `folderInfoAvailable`. Counts are `null` when the API is missing or one folder cannot be read; the listing itself does not fail.
+
+`delete_folder` returns `deleted: true, movedToTrash: false` when the folder is gone. On Local Folders (and servers that behave the same way) Thunderbird moves the folder into Trash instead; the result is then `deleted: false, movedToTrash: true` with `newPath` and `trashedFolder`.
+
+`largest` on a Gmail account counts each `Message-ID` once (a labelled copy is preferred over All Mail) and returns `deduplicatedByMessageId: true` and `duplicatesSkipped`. Other servers keep real duplicate copies.
 
 `compact_folder` requires `folder` and `confirm: true`. It invokes Thunderbird's native compaction for one folder, skips work when Thunderbird reports no expunged bytes, and returns `beforeBytes`, `afterBytes`, `reclaimedBytes`, `beforeExpungedBytes`, `afterExpungedBytes`, `skipped` and `messagesChanged: false`. It is intended as occasional maintenance after a cleanup, not after every mutation batch.
 
@@ -205,6 +242,19 @@ System/root folders are protected from rename/delete actions.
 The host should send the returned continuation token with the same operation and filters to process the next batch. Continuation tokens expire and are tied to the operation, account, source, resolved destination ID (including default Trash/Inbox destinations), supplied destination selector, sender, recipient, address, subject, text, dates and subfolder scope to reduce accidental filter changes during a destructive job. A mismatched request is rejected without consuming its valid token. Bulk filters may use `from`/`author`, `to`/`recipient`, `address`, `subject`, `fullText`/`text`, `since` or `until`.
 
 `dry_run: true` can be used by supported bulk operations to inspect how many messages would be affected before performing the mutation.
+
+### Move verification
+
+`move` uses Thunderbird's `messages.move` (IMAP `MOVE` where the server supports it, otherwise Thunderbird's own copy/expunge). The bridge does not copy and delete on its own: on Gmail a delete from Inbox goes to Trash and removes every label. After moving, the extension:
+
+1. checks that each moved `Message-ID` is in the destination and that the original IDs left the source (up to 15 s);
+2. waits a settle window (10 s on Gmail, 5 s on other IMAP, none for Local Folders), asks Thunderbird to refresh both folders from the server (`mailbridge.refreshFolder`, skipped if unavailable) and checks again.
+
+The result includes `verified`, `immediateVerified`, `destinationVerified`, `sourceVerified`, `settleMs`, `refreshed`, `movedButUnverified`, `missingInDestination` (up to 20 Message-IDs), `destinationDuplicates`, `status` (`verified_moved` or `moved_but_unverified`) and `warning`. On Gmail, a destination label that already held the message only has to contain it; elsewhere each moved message must add a copy. An unverified batch returns no `continuation` even when `more: true`; check the destination and All Mail before continuing. Gmail can still drop a label later than the settle window, so hosts that need certainty should re-check with `search` after a few minutes.
+
+### Gmail label safety
+
+On Gmail a label folder is a view of one message. `trash` or `move` from a label other than Inbox, Trash, Spam or All Mail is rejected without changes (also for `dry_run`) when any selected `Message-ID` also exists in Inbox or another label, because trashing it would remove it from there too. Messages without a `Message-ID` are rejected for the same reason. Run the operation from Inbox, or select messages that only carry that label. For `move`, `allow_other_labels: true` accepts removing just the source label. Gmail All Mail sources keep their separate protection.
 
 ## Permanent deletion
 
@@ -231,6 +281,12 @@ The protocol is experimental until `1.0`. If you build another host implementati
 
 ## Result delivery and uncertain outcomes
 
+### Operation timeouts
+
+The extension limits how long it waits for one operation: 120 s for reads, 10 minutes for mutations, 20 minutes for `compact_folder` and `empty_trash`. A timeout cannot stop Thunderbird's own work. A timed-out mutation returns `ok: false` with an error containing `outcome unknown` (it may have executed or still be running; do not retry automatically). A timed-out read says nothing changed. The extension logs a `console.warn` with the operation name and continues with the next request, so a later operation may run while a timed-out one is still finishing. Hosts usually time out earlier (SuperCLI: 20–120 s) and must treat that as outcome unknown too.
+
+### Delivery
+
 Execution and delivery are separate. The extension serializes the operation result
 once, then retries only `POST /result` (up to three attempts, five-second HTTP
 timeout, 250 ms then 1 s delays). A network error or lost acknowledgement never
@@ -248,11 +304,13 @@ uncertain mutation.
 
 The process-local recovery cache holds at most 128 IDs and 8 MiB of UTF-8 result
 payloads, reserving 4 MiB per admitted pending request. When either bound would
-be exceeded, a new request is left unadmitted and unexecuted, with no result
-posted; its caller may time out. Sending a terminal rejection without remembering
-its ID would be unsafe, because a later same-ID arrival could execute after that
-rejection. A never-admitted ID has no completed operation to replay and may be
-admitted later. Polling continues so retained IDs can still recover at capacity. Results exceeding the
+be exceeded, a new request is not executed and the host receives an explicit
+error: `{"id": ..., "ok": false, "notExecuted": true, "error": "... NOT executed ..."}`.
+The rejected ID is remembered (up to 256 IDs for ten minutes) and a same-ID
+re-arrival receives the same rejection, so it can never execute after the host
+accepted the failure. Hosts should retry later with a new ID. Beyond 256
+retained rejections a request is dropped without a result, as before, and its
+caller times out. Polling continues so retained IDs can still recover at capacity. Results exceeding the
 4 MiB host transport limit, or failing serialization, produce an explicit
 outcome-unknown response; the operation may already have executed. Temporary
 serialization buffers and request arguments are not included in this result-byte
