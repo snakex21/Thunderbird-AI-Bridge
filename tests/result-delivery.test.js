@@ -261,3 +261,23 @@ test("operation limits: reads 120 s, mutations longer", () => {
   assert.ok(f.read('operationTimeoutMs("trash")') > 120000);
   assert.ok(f.read('operationTimeoutMs("compact_folder")') >= f.read('operationTimeoutMs("trash")'));
 });
+
+test("poll loop pauses after HTTP 204 instead of busy-waiting", async () => {
+  let polls = 0;
+  const delays = [];
+  const context = vm.createContext({
+    messenger: { accounts: { list: async () => [] } },
+    console: { warn() {}, log() {} },
+    AbortController, TextEncoder, Date,
+    // Record requested delays without ever firing them, freezing the loop.
+    setTimeout: (_, ms) => { delays.push(ms); return 0; }, clearTimeout() {},
+    fetch: async url => {
+      if (url.includes("/poll?")) { polls++; return { status: 204, ok: true }; }
+      return { ok: true, status: 204 };
+    },
+  });
+  vm.runInContext(source, context);
+  for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(polls, 1, "a 204 must not immediately trigger another poll");
+  assert.deepEqual(delays, [250]);
+});

@@ -1991,6 +1991,8 @@ async function requestWorker() {
   }
 }
 
+const POLL_IDLE_DELAY_MS = 250;
+
 async function bridgeLoop() {
   for (;;) {
     pruneRequestRecords();
@@ -1998,7 +2000,12 @@ async function bridgeLoop() {
       const response = await fetch(`${BRIDGE_URL}/poll?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
         cache: "no-store",
       });
-      if (response.status === 204) continue;
+      if (response.status === 204) {
+        // A host that answers 204 immediately (no long-poll) must not turn
+        // this loop into a busy-wait.
+        await sleep(POLL_IDLE_DELAY_MS);
+        continue;
+      }
       if (!response.ok) throw new Error(`Bridge poll HTTP ${response.status}`);
       const request = await response.json();
       if (!request || !request.id) continue;
