@@ -12,7 +12,7 @@ It is **not tied to one AI model, one CLI or one cloud provider**. The Thunderbi
 
 The project is designed for local-first use: Thunderbird talks to `127.0.0.1`, so mailbox access does not need to be exposed directly to the network.
 
-> Status: experimental, currently based on the working `0.9.34` bridge. The protocol may still change before `1.0`.
+> Status: experimental (0.10.0, protocol 2 with pairing). The protocol may still change before `1.0`.
 
 ## Why this exists
 
@@ -71,13 +71,21 @@ Thunderbird AI Bridge extension
 Thunderbird → IMAP / Gmail / local folders / other configured accounts
 ```
 
-The extension currently polls a host on:
+The extension polls a host on:
 
 ```text
 http://127.0.0.1:47831
 ```
 
-The current default token and the legacy internal add-on ID are retained for compatibility with the original SuperCLI host implementation. This lets the public build replace the development add-on instead of installing a second polling copy beside it. A future release should make endpoint and token configuration user-selectable.
+but only after the user **paired** it with that host. Pairing is a one-time step:
+
+1. In the host (SuperCLI: *Settings -> Thunderbird -> Pair* or `/thunderbird pair` in the terminal; NestCafe: *Settings -> Integrations -> Thunderbird -> Pair*) a 16-character code appears, valid for 5 minutes.
+2. In Thunderbird open *Add-ons and Themes -> Thunderbird AI Bridge -> Options*, enter the code and click **Pair**.
+3. The options page shows *Connected* and the host's name. Both sides now hold the same 256-bit secret; the code itself is useless afterwards.
+
+Each connection is mutually authenticated and every message is signed (see [SECURITY.md](SECURITY.md) and [docs/PROTOCOL.md](docs/PROTOCOL.md)). A different program on the port is shown in the options page ("Another program holds the bridge port", "Untrusted program on the bridge port") and receives nothing. Hosts from before protocol 2 (SuperCLI 1.0.24 and older) do not work with 0.10.0 and are reported as outdated.
+
+The legacy internal add-on ID `supercli-bridge@local` is kept, so installing 0.10.0 replaces an older copy instead of adding a second one.
 
 ## Important: SuperCLI is not required
 

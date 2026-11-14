@@ -28,6 +28,16 @@ Operacje zmieniające lub usuwające dane mają dodatkowe zabezpieczenia. Wrażl
 
 Bridge jest projektowany do pracy lokalnej. Nie wystawiaj jego hosta bezpośrednio do sieci LAN ani Internetu.
 
+## Parowanie (od 0.10.0)
+
+Rozszerzenie łączy się tylko z hostem, z którym zostało sparowane. Robi się to raz:
+
+1. W hoście (SuperCLI: *Ustawienia → Thunderbird → Paruj* albo `/thunderbird pair` w terminalu; NestCafe: *Ustawienia → Integracje → Thunderbird → Paruj*) pojawia się 16-znakowy kod ważny 5 minut.
+2. W Thunderbirdzie: *Dodatki i motywy → Thunderbird AI Bridge → Opcje*, wpisz kod i kliknij **Paruj**.
+3. Strona opcji pokazuje *Połączono* i nazwę hosta.
+
+Obie strony uzgadniają wtedy 256-bitowy sekret (ECDH uwierzytelniony kodem). Każde połączenie jest uwierzytelniane w obie strony, a każda wiadomość podpisana (HMAC-SHA256 ze znacznikiem czasu i nonce). Inny program na porcie 47831 nic nie dostaje i nic nie może wykonać; strona opcji pokazuje wtedy, kto zajmuje port. Hosty sprzed protokołu 2 (SuperCLI 1.0.24 i starsze) nie współpracują z 0.10.0.
+
 ## Budowanie
 
 Wymagany jest Thunderbird 128 lub nowszy. Aby zbudować XPI:
@@ -44,6 +54,6 @@ Testy:
 npm test
 ```
 
-Projekt jest eksperymentalny (`0.9.34`) i protokół może się jeszcze zmienić przed wersją `1.0`.
+Projekt jest eksperymentalny (`0.10.0`, protokół 2 z parowaniem) i protokół może się jeszcze zmienić przed wersją `1.0`.
 
 Licencja: MIT. Projekt jest niezależny i nie jest oficjalnym produktem Mozilli ani Thunderbirda.

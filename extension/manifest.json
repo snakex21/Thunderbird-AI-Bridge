@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Thunderbird AI Bridge",
-  "version": "0.9.34",
+  "version": "0.10.0",
   "description": "Local Thunderbird bridge for AI agents, CLIs and automation: mailbox search, message reading, attachments, folder operations, import, verified deletion and native IMAP maintenance.",
   "applications": {
     "gecko": {
@@ -17,11 +17,16 @@
     "messagesMove",
     "messagesDelete",
     "addressBooks",
+    "storage",
     "http://127.0.0.1:47831/*"
   ],
   "background": {
-    "scripts": ["background.js"],
+    "scripts": ["bridge-auth.js", "background.js"],
     "persistent": true
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
   },
   "experiment_apis": {
     "mailbridge": {

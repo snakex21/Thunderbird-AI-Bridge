@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>Thunderbird AI Bridge</title>
+<style>
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 16px; max-width: 640px; }
+  h1 { font-size: 17px; margin: 0 0 12px; }
+  h2 { font-size: 14px; margin: 20px 0 8px; }
+  .status { padding: 10px 12px; border-radius: 8px; border: 1px solid #8884; }
+  .status[data-tone="ok"] { border-color: #2e7d32; }
+  .status[data-tone="warn"] { border-color: #b26a00; }
+  .status[data-tone="bad"] { border-color: #c62828; }
+  .status strong { display: block; margin-bottom: 4px; }
+  .muted { opacity: .75; font-size: 13px; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; }
+  input { font: 15px ui-monospace, monospace; letter-spacing: .08em; padding: 6px 8px; min-width: 240px; text-transform: uppercase; }
+  button { font: inherit; padding: 6px 12px; }
+  ul { padding-left: 18px; margin: 6px 0; }
+  li { margin: 4px 0; }
+  .message { min-height: 1.4em; margin-top: 8px; }
+  .message[data-tone="bad"] { color: #c62828; }
+  .message[data-tone="ok"] { color: #2e7d32; }
+</style>
+</head>
+<body>
+<h1 data-i18n="title">Thunderbird AI Bridge</h1>
+<div class="status" id="status" role="status" aria-live="polite">
+  <strong id="status-title">…</strong>
+  <span id="status-detail" class="muted"></span>
+</div>
+
+<h2 data-i18n="pairHeading">Pair with SuperCli / NestCafe</h2>
+<p class="muted" data-i18n="pairHelp">In SuperCli (Settings → Thunderbird, or /thunderbird pair in the terminal) or NestCafe (Settings → Integrations) click “Pair”. Enter the 16-character code shown there.</p>
+<form id="pair-form" autocomplete="off">
+  <input id="code" name="code" maxlength="24" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" aria-label="Pairing code" required>
+  <button type="submit" id="pair-button" data-i18n="pairButton">Pair</button>
+</form>
+<div class="message" id="pair-message" role="alert"></div>
+
+<h2 data-i18n="pairedHeading">Paired programs</h2>
+<ul id="pairings"></ul>
+<p class="muted" id="version"></p>
+<script src="options.js"></script>
+</body>
+</html>

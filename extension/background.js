@@ -1,7 +1,9 @@
 "use strict";
 
 const BRIDGE_URL = "http://127.0.0.1:47831";
-const BRIDGE_TOKEN = "supercli-thunderbird-local-v1-7b2e44c91a";
+// Protocol 2: no shared constant token. The host is trusted only after the
+// pairing secret (agreed once through a code shown by the host) proves it;
+// see bridge-auth.js and docs/PROTOCOL.md.
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1641,14 +1643,13 @@ async function executeRequest(request) {
     const transferId = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
     const filename = String(attachment.name || file.name || "attachment.bin").trim() || "attachment.bin";
     const contentType = String(file.type || attachment.contentType || "application/octet-stream").trim() || "application/octet-stream";
-    const uploadURL = `${BRIDGE_URL}/attachment-file?token=${encodeURIComponent(BRIDGE_TOKEN)}&id=${encodeURIComponent(transferId)}&filename=${encodeURIComponent(filename)}&content_type=${encodeURIComponent(contentType)}`;
-    const upload = await fetch(uploadURL, {
-      method: "POST",
-      headers: { "Content-Type": contentType },
-      body: file,
+    const uploadPath = `/v2/attachment-file?id=${encodeURIComponent(transferId)}&filename=${encodeURIComponent(filename)}&content_type=${encodeURIComponent(contentType)}`;
+    const upload = await bridgeRequest("POST", uploadPath, {
+      body: new Uint8Array(await file.arrayBuffer()),
+      contentType,
     });
     if (!upload.ok) {
-      const detail = await upload.text().catch(() => "");
+      const detail = upload.text();
       throw new Error(`Nie udało się przekazać załącznika do local bridge host (HTTP ${upload.status})${detail ? `: ${detail.trim()}` : ""}.`);
     }
     const message = await messenger.messages.get(messageId);
@@ -1677,12 +1678,9 @@ async function executeRequest(request) {
     const destination = await resolveFolder(account, args.destination);
     if (!destination) throw new Error(`Nie znaleziono folderu docelowego: ${args.destination}`);
 
-    const response = await fetch(
-      `${BRIDGE_URL}/message-file?token=${encodeURIComponent(BRIDGE_TOKEN)}&id=${encodeURIComponent(transferId)}`,
-      { cache: "no-store" }
-    );
+    const response = await bridgeRequest("GET", `/v2/message-file?id=${encodeURIComponent(transferId)}`);
     if (!response.ok) throw new Error(`Nie udało się pobrać przekonwertowanej wiadomości z local bridge host (HTTP ${response.status}).`);
-    const blob = await response.blob();
+    const blob = new Blob([response.bytes], { type: "message/rfc822" });
     const sourceName = String(args.source_name || "message.msg").trim() || "message.msg";
     const emlName = String(args.eml_name || sourceName.replace(/\.msg$/i, ".eml") || "message.eml").trim();
     const file = new File([blob], emlName, { type: "message/rfc822", lastModified: Date.now() });
@@ -2319,10 +2317,9 @@ async function postResult(body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
   try {
-    const response = await fetch(`${BRIDGE_URL}/result?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
+    const response = await bridgeRequest("POST", "/v2/result", {
       body,
+      contentType: "application/json; charset=utf-8",
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -2429,13 +2426,340 @@ async function requestWorker() {
 
 const POLL_IDLE_DELAY_MS = 250;
 
+// ---------------------------------------------------------------------------
+// Protocol 2 transport: pairing, mutual authentication and signed messages.
+// ---------------------------------------------------------------------------
+
+const BRIDGE_PAIRINGS_KEY = "bridgePairings";
+const BRIDGE_RETRY_NO_HOST_MS = 1000;
+const BRIDGE_RETRY_REJECTED_MS = 3000;
+const BRIDGE_RETRY_UNPAIRED_MS = 2000;
+
+const bridgeStatus = {
+  phase: "starting",
+  detail: "",
+  host: null,
+  since: Date.now(),
+};
+let bridgeSession = null;
+let bridgeSessionPromise = null;
+let bridgeWake = null;
+
+function setBridgeStatus(phase, detail = "", host = null) {
+  if (bridgeStatus.phase !== phase || bridgeStatus.detail !== detail) bridgeStatus.since = Date.now();
+  bridgeStatus.phase = phase;
+  bridgeStatus.detail = detail;
+  bridgeStatus.host = host;
+}
+
+function bridgeStorage() {
+  return globalThis.messenger?.storage?.local || null;
+}
+
+async function loadBridgePairings() {
+  const storage = bridgeStorage();
+  if (!storage) return {};
+  const stored = await storage.get(BRIDGE_PAIRINGS_KEY);
+  const pairings = stored?.[BRIDGE_PAIRINGS_KEY];
+  return pairings && typeof pairings === "object" ? pairings : {};
+}
+
+async function saveBridgePairings(pairings) {
+  const storage = bridgeStorage();
+  if (!storage) throw new Error("storage unavailable");
+  await storage.set({ [BRIDGE_PAIRINGS_KEY]: pairings });
+}
+
+function hostLabel(info) {
+  if (!info) return "";
+  const app = String(info.app || "host").slice(0, 40);
+  const version = info.appVersion ? ` ${String(info.appVersion).slice(0, 20)}` : "";
+  const pid = Number.isSafeInteger(info.pid) ? ` (pid ${info.pid})` : "";
+  return `${app}${version}${pid}`;
+}
+
+class BridgeError extends Error {
+  constructor(message, { phase = "error", retryMs = BRIDGE_RETRY_REJECTED_MS, reauth = false, permanent = false } = {}) {
+    super(message);
+    this.phase = phase;
+    this.retryMs = retryMs;
+    this.reauth = reauth;
+    this.permanent = permanent;
+  }
+}
+
+async function bridgeFetchJSON(path, options = {}) {
+  const response = await fetch(`${BRIDGE_URL}${path}`, { cache: "no-store", ...options });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_) {
+    data = null;
+  }
+  return { response, data };
+}
+
+// hello identifies whoever holds the port. Nothing secret is sent.
+async function bridgeHello() {
+  let result;
+  try {
+    result = await bridgeFetchJSON("/v2/hello");
+  } catch (_) {
+    throw new BridgeError("No SuperCli/NestCafe host is listening on 127.0.0.1:47831.", { phase: "no_host", retryMs: BRIDGE_RETRY_NO_HOST_MS });
+  }
+  const { response, data } = result;
+  if (response.status === 404) {
+    throw new BridgeError("The program on 127.0.0.1:47831 is an older SuperCli/NestCafe without pairing. Update it; nothing was sent to it.", { phase: "host_outdated" });
+  }
+  if (!response.ok || !data || data.proto !== BridgeAuth.PROTOCOL || typeof data.hostId !== "string" || !data.hostId) {
+    throw new BridgeError(`The program on 127.0.0.1:47831 does not speak Thunderbird Bridge protocol ${BridgeAuth.PROTOCOL} (HTTP ${response.status}). Nothing was sent to it.`, { phase: "host_unknown" });
+  }
+  return data;
+}
+
+// Mutual challenge-response. The host proves the pairing secret too, so an
+// impostor on the port is detected before any request is accepted from it.
+async function bridgeAuthenticate() {
+  const pairings = await loadBridgePairings();
+  if (!Object.keys(pairings).length) {
+    throw new BridgeError("Not paired. Start pairing in SuperCli or NestCafe and enter the code in this extension's options.", { phase: "unpaired", retryMs: BRIDGE_RETRY_UNPAIRED_MS });
+  }
+  const hello = await bridgeHello();
+  const pairing = pairings[hello.hostId];
+  if (!pairing) {
+    throw new BridgeError(`Port 47831 is held by ${hostLabel(hello)}, which is not paired with this Thunderbird. Nothing was sent to it.`, { phase: "host_not_paired" });
+  }
+  if (!hello.challenge) {
+    throw new BridgeError(`${hostLabel(hello)} has no pairing (it was removed there). Pair again.`, { phase: "pairing_revoked" });
+  }
+  const key = BridgeAuth.fromB64u(pairing.key);
+  const extNonce = BridgeAuth.randomB64(32);
+  const extVersion = globalThis.messenger?.runtime?.getManifest?.().version || "";
+  const proof = await BridgeAuth.mac64(key, ["auth-ext", hello.hostId, pairing.pairingId, hello.challenge, extNonce]);
+  let result;
+  try {
+    result = await bridgeFetchJSON("/v2/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hostId: hello.hostId, pairingId: pairing.pairingId, hostNonce: hello.challenge, extNonce, extVersion, mac: proof }),
+    });
+  } catch (_) {
+    throw new BridgeError("The host closed the connection during authentication.", { phase: "no_host", retryMs: BRIDGE_RETRY_NO_HOST_MS });
+  }
+  const { response, data } = result;
+  if (!response.ok || !data?.sessionId) {
+    const code = String(data?.error || `HTTP ${response.status}`);
+    if (["not_paired", "pairing_revoked", "wrong_host"].includes(code)) {
+      throw new BridgeError(`${hostLabel(hello)} no longer accepts this pairing (${code}). Pair again.`, { phase: "pairing_revoked" });
+    }
+    throw new BridgeError(`${hostLabel(hello)} rejected authentication (${code}).`, { phase: "auth_failed" });
+  }
+  const hostOk = await BridgeAuth.verifyMac(key, data.mac, ["auth-host", hello.hostId, pairing.pairingId, hello.challenge, extNonce, data.sessionId]);
+  if (!hostOk) {
+    throw new BridgeError(`The program on port 47831 claims to be ${hostLabel(hello)} but failed the pairing proof. It is not trusted; nothing was sent to it.`, { phase: "host_impostor" });
+  }
+  const sessionKey = await BridgeAuth.hmacKey(await BridgeAuth.sessionKey(key, hello.challenge, extNonce, data.sessionId));
+  return { id: data.sessionId, key: sessionKey, host: { hostId: hello.hostId, app: hello.app, appVersion: hello.appVersion, pid: hello.pid } };
+}
+
+async function ensureBridgeSession() {
+  if (bridgeSession) return bridgeSession;
+  if (!bridgeSessionPromise) {
+    bridgeSessionPromise = (async () => {
+      try {
+        const session = await bridgeAuthenticate();
+        bridgeSession = session;
+        setBridgeStatus("connected", "", session.host);
+        return session;
+      } catch (error) {
+        setBridgeStatus(error.phase || "error", String(error.message || error));
+        throw error;
+      } finally {
+        bridgeSessionPromise = null;
+      }
+    })();
+  }
+  return bridgeSessionPromise;
+}
+
+function dropBridgeSession(session) {
+  if (!session || bridgeSession === session) bridgeSession = null;
+}
+
+// bridgeRequest sends one signed request and verifies the signed response.
+// It resolves to { ok, status, bytes, text(), json() } only for responses
+// carrying a valid host signature bound to this request's nonce.
+async function bridgeRequest(method, path, { body = null, contentType = "", signal } = {}) {
+  const session = await ensureBridgeSession();
+  const bodyBytes = body === null || body === undefined ? new Uint8Array(0) : (typeof body === "string" ? new TextEncoder().encode(body) : body);
+  // Sign the path exactly as fetch will send it (the URL parser may
+  // percent-encode characters in the query).
+  const url = new URL(`${BRIDGE_URL}${path}`);
+  const signedPath = `${url.pathname}${url.search}`;
+  const ts = String(Date.now());
+  const nonce = BridgeAuth.randomB64(16);
+  const bodyHash = await BridgeAuth.sha256B64(bodyBytes);
+  const requestMac = await BridgeAuth.mac64(session.key, BridgeAuth.requestFields(method, signedPath, ts, nonce, bodyHash));
+  const headers = { "X-TB-Session": session.id, "X-TB-Ts": ts, "X-TB-Nonce": nonce, "X-TB-Mac": requestMac };
+  if (contentType) headers["Content-Type"] = contentType;
+  const response = await fetch(url.href, {
+    method,
+    headers,
+    body: method === "GET" ? undefined : bodyBytes,
+    cache: "no-store",
+    signal,
+  });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const responseTs = response.headers.get("X-TB-Ts") || "";
+  const responseMac = response.headers.get("X-TB-Mac") || "";
+  const valid = Boolean(responseMac) && BridgeAuth.timestampFresh(responseTs) &&
+    await BridgeAuth.verifyMac(session.key, responseMac, BridgeAuth.responseFields(response.status, nonce, responseTs, await BridgeAuth.sha256B64(bytes)));
+  if (!valid) {
+    dropBridgeSession(session);
+    if (response.status === 401) {
+      throw new BridgeError("Bridge session expired; authenticating again.", { phase: "connecting", retryMs: 0, reauth: true });
+    }
+    throw new BridgeError("A bridge response failed signature verification and was discarded.", { phase: "host_impostor", reauth: true });
+  }
+  return {
+    ok: response.ok,
+    status: response.status,
+    bytes,
+    text: () => new TextDecoder().decode(bytes),
+    json: () => JSON.parse(new TextDecoder().decode(bytes)),
+  };
+}
+
+// Pairing: the user copies the code shown by SuperCli/NestCafe into the
+// options page. The code authenticates an ECDH exchange; the resulting secret
+// never leaves Thunderbird's extension storage and the host's data folder.
+async function pairWithCode(rawCode) {
+  const normalized = BridgeAuth.normalizeCode(rawCode);
+  if (!normalized) throw new Error("The code must have 16 characters, for example ABCD-EFGH-JKMN-PQRS.");
+  const hello = await bridgeHello();
+  const codeKey = await BridgeAuth.codeKey(normalized);
+  const ecdh = await BridgeAuth.generateEcdh();
+  const extNonce = BridgeAuth.randomB64(32);
+  const extVersion = globalThis.messenger?.runtime?.getManifest?.().version || "";
+  const start = await bridgeFetchJSON("/v2/pair/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      proto: BridgeAuth.PROTOCOL,
+      extPub: ecdh.publicB64,
+      extNonce,
+      extVersion,
+      mac: await BridgeAuth.mac64(codeKey, ["pair-start", ecdh.publicB64, extNonce]),
+    }),
+  });
+  if (!start.response.ok || !start.data?.hostPub) {
+    throw new Error(start.data?.message || `Pairing refused (HTTP ${start.response.status}).`);
+  }
+  if (start.data.hostId !== hello.hostId) throw new Error("The host changed during pairing. Try again.");
+  const transcript = await BridgeAuth.pairTranscript(hello.hostId, ecdh.publicB64, start.data.hostPub, extNonce, start.data.hostNonce);
+  const shared = await BridgeAuth.ecdhShared(ecdh.privateKey, start.data.hostPub);
+  const key = await BridgeAuth.pairingKey(shared, codeKey, transcript);
+  if (!(await BridgeAuth.verifyMac(key, start.data.mac, ["pair-host", transcript]))) {
+    throw new Error("The host failed the pairing proof (wrong code or impostor). Nothing was saved.");
+  }
+  const finish = await bridgeFetchJSON("/v2/pair/finish", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hostId: hello.hostId, mac: await BridgeAuth.mac64(key, ["pair-ext", transcript]) }),
+  });
+  if (!finish.response.ok || !finish.data?.pairingId) {
+    throw new Error(finish.data?.message || `Pairing failed (HTTP ${finish.response.status}).`);
+  }
+  if (!(await BridgeAuth.verifyMac(key, finish.data.mac, ["pair-done", transcript, finish.data.pairingId]))) {
+    throw new Error("The host failed the final pairing proof. Nothing was saved.");
+  }
+  const pairings = await loadBridgePairings();
+  pairings[hello.hostId] = {
+    pairingId: finish.data.pairingId,
+    key: BridgeAuth.b64u(key),
+    app: String(start.data.app || hello.app || "").slice(0, 40),
+    appVersion: String(start.data.appVersion || "").slice(0, 20),
+    pairedAt: new Date().toISOString(),
+  };
+  await saveBridgePairings(pairings);
+  dropBridgeSession();
+  wakeBridgeLoop();
+  return { hostId: hello.hostId, app: pairings[hello.hostId].app };
+}
+
+async function unpairHost(hostId) {
+  const pairings = await loadBridgePairings();
+  delete pairings[String(hostId)];
+  await saveBridgePairings(pairings);
+  if (bridgeSession?.host?.hostId === hostId) dropBridgeSession();
+  wakeBridgeLoop();
+}
+
+async function bridgeStatusReport() {
+  const pairings = await loadBridgePairings();
+  return {
+    version: globalThis.messenger?.runtime?.getManifest?.().version || "",
+    protocol: BridgeAuth.PROTOCOL,
+    phase: bridgeStatus.phase,
+    detail: bridgeStatus.detail,
+    host: bridgeStatus.host,
+    since: bridgeStatus.since,
+    pairings: Object.entries(pairings).map(([hostId, p]) => ({ hostId, app: p.app, appVersion: p.appVersion, pairedAt: p.pairedAt })),
+  };
+}
+
+function wakeBridgeLoop() {
+  const wake = bridgeWake;
+  bridgeWake = null;
+  if (wake) wake();
+}
+
+function bridgeSleep(ms) {
+  return new Promise((resolve) => {
+    bridgeWake = resolve;
+    setTimeout(resolve, ms);
+  });
+}
+
+if (globalThis.messenger?.runtime?.onMessage) {
+  messenger.runtime.onMessage.addListener((message, sender) => {
+    if (sender?.id !== messenger.runtime.id || !message || typeof message.type !== "string") return undefined;
+    if (message.type === "bridge-status") return bridgeStatusReport();
+    if (message.type === "bridge-pair") {
+      return pairWithCode(message.code).then(
+        (host) => ({ ok: true, host }),
+        (error) => ({ ok: false, error: String(error?.message || error) })
+      );
+    }
+    if (message.type === "bridge-unpair") return unpairHost(message.hostId).then(() => ({ ok: true }));
+    return undefined;
+  });
+}
+
+if (globalThis.messenger?.storage?.onChanged) {
+  messenger.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[BRIDGE_PAIRINGS_KEY]) {
+      dropBridgeSession();
+      wakeBridgeLoop();
+    }
+  });
+}
+
 async function bridgeLoop() {
+  // Outside Thunderbird (unit tests) there is no extension storage and so no
+  // pairing: never contact anything.
+  if (!bridgeStorage()) return;
   for (;;) {
     pruneRequestRecords();
+    let session;
     try {
-      const response = await fetch(`${BRIDGE_URL}/poll?token=${encodeURIComponent(BRIDGE_TOKEN)}`, {
-        cache: "no-store",
-      });
+      session = await ensureBridgeSession();
+    } catch (error) {
+      await bridgeSleep(error.retryMs ?? BRIDGE_RETRY_REJECTED_MS);
+      continue;
+    }
+    try {
+      const response = await bridgeRequest("GET", "/v2/poll");
       if (response.status === 204) {
         // A host that answers 204 immediately (no long-poll) must not turn
         // this loop into a busy-wait.
@@ -2443,13 +2767,18 @@ async function bridgeLoop() {
         continue;
       }
       if (!response.ok) throw new Error(`Bridge poll HTTP ${response.status}`);
-      const request = await response.json();
+      const request = response.json();
       if (!request || !request.id) continue;
       // Keep polling immediately even while Thunderbird is executing a slow
       // search. Otherwise a busy extension looks disconnected to the host.
       enqueueRequest(request);
-    } catch (_) {
-      await sleep(1000);
+    } catch (error) {
+      if (!(error instanceof BridgeError)) {
+        // Network error: the host went away. Authenticate again next time.
+        dropBridgeSession(session);
+        setBridgeStatus("no_host", "The host stopped answering.");
+      }
+      await sleep(error?.retryMs ?? BRIDGE_RETRY_NO_HOST_MS);
     }
   }
 }

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.0 - 2026-11-14
+
+### Security: pairing and authenticated transport (protocol 2)
+
+0.9.x authenticated with a constant token compiled into the extension and every host, and the host allowed CORS `*`. Any local program, a second SuperCLI/NestCafe copy or a web page could take port 47831, and Thunderbird attached to whoever held it (this happened during a review: a test copy of NestCafe received the real mailbox connection).
+
+- **Pairing.** The host shows a one-time 16-character code (5 minutes, 5 attempts). Enter it in the new options page (*Add-ons -> Thunderbird AI Bridge -> Options*). Both sides derive a 256-bit secret with ECDH P-256 authenticated by the code (HKDF-SHA256); the code and the secret never appear in URLs or logs. The secret is kept in the extension's storage; *Unpair* removes it.
+- **Mutual authentication.** On every connection the extension and the host prove the secret to each other with HMAC-SHA256 over fresh nonces. The extension polls only after the host's proof verified, so a program that took the port without the secret gets no poll, no result and cannot make Thunderbird execute anything.
+- **Signed messages.** Every request (poll, result, attachment upload, message download) carries an HMAC over method, path, timestamp, nonce and body hash; every response is signed and bound to the request nonce. Stale, replayed, tampered or unsigned messages are rejected.
+- **Clear status.** The options page shows *Connected* (with the host's name and pid), *Not paired*, *Waiting for SuperCLI / NestCafe*, *Another program holds the bridge port*, *Untrusted program on the bridge port*, *Pairing no longer accepted* or *Program on the bridge port is outdated*.
+- **Breaking change.** Requires a protocol 2 host (SuperCLI 1.0.25 / NestCafe 2.1.2 or newer). Older hosts are refused; a 1.0.25 host answers older extensions with "update the extension". New permission: `storage`.
+- `docs/PROTOCOL.md` documents protocol 2 normatively. New tests: `tests/bridge-auth.test.js` (vectors shared with the Go host, cross-check against node:crypto) and `tests/bridge-transport.test.js` (the real background script against a mock host: happy path, wrong code, impostor with a copied host id, another host, an old host, tampered and replayed responses, 204 back-off).
+
 ## 0.9.34 - 2026-11-13
 
 ### Fixed after live testing (2026-11-13)

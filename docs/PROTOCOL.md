@@ -1,93 +1,121 @@
 # Thunderbird AI Bridge protocol
 
-This document describes the localhost transport expected by the Thunderbird extension in the current `0.9.34` implementation.
+This document describes protocol 2 (`tb-bridge/2`), implemented by the extension since `0.10.0`. Protocol 1 (a constant token in the URL, CORS `*`) is gone: any local process knew the token, so any program that took the port could drive the mailbox. A protocol 2 extension never talks to a protocol 1 host, and a protocol 2 host answers protocol 1 requests with `426 Upgrade Required`.
 
 ## Transport
-
-Default host:
 
 ```text
 http://127.0.0.1:47831
 ```
 
-The extension is the polling side. The host process owns a small request queue and file-transfer storage.
+The extension is the polling side. The host owns a request queue and file-transfer storage. Only a host that the user paired with this Thunderbird profile, and that proves it on every connection, receives polls or results.
 
-### Host requirements (CORS and long-poll)
+### Host requirements
 
-The extension runs in Thunderbird's background page, so every host endpoint is a cross-origin request. A host **MUST**:
+A host **MUST**:
 
-- send `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS` and `Access-Control-Allow-Headers: Content-Type` on every response (including errors), and
-- answer an `OPTIONS` preflight with `204 No Content` and the same headers.
+- listen on `127.0.0.1` only;
+- refuse a request whose `Host` header is not exactly the bridge address (`127.0.0.1:47831`), so DNS-rebinding pages cannot reach it (SuperCli answers `421`);
+- refuse every request that carries a web `Origin` (`http:`, `https:`, `file:`, `null`, another browser's extension scheme) with `403` and without CORS headers. Requests without `Origin` (non-browser clients) still have to authenticate;
+- never send `Access-Control-Allow-Origin: *`. For `/v2/hello`, `/v2/pair/*` and `/v2/auth` it may echo any `moz-extension://` origin (so an unpaired or outdated extension can read why it was refused); for every other endpoint it echoes only the exact origin recorded at pairing. With the echoed origin send `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, X-TB-Session, X-TB-Ts, X-TB-Nonce, X-TB-Mac`, `Access-Control-Expose-Headers: X-TB-Ts, X-TB-Mac` and `Vary: Origin`, and answer `OPTIONS` with `204`;
+- keep the pairing secret out of URLs and logs, and store it protected (SuperCli: DPAPI for the current Windows user, file restricted to that account).
 
-Without these headers Thunderbird rejects the response and the bridge looks disconnected.
+A host that is not paired and has no active pairing code **SHOULD NOT** listen at all, so a second copy of the host cannot shadow the paired one. A host that cannot bind the port must not take over in any other way; SuperCli reports which instance holds it (from `/v2/hello`).
 
-`/poll` **SHOULD** be a long-poll: keep the request open (SuperCLI uses 20 s) until a request is queued, then answer immediately. The extension polls again right after each answer. Since 0.9.32 it waits 250 ms after a `204` before polling again, so a host that answers `204` immediately does not cause a busy loop, but a new request may then wait up to 250 ms before Thunderbird sees it. After a network error the extension waits 1 s.
+### Encoding
 
-### `GET /poll?token=...`
+All binary values are unpadded base64url. A *MAC* is HMAC-SHA256 over its fields joined with `\n`, sent as base64url. A *body hash* is the base64url SHA-256 of the exact body bytes (the empty string for no body). MACs are compared in constant time.
 
-Returns the next queued request as JSON, or HTTP `204 No Content` when no request is waiting.
+## Pairing
 
-Request envelope:
+The host shows a one-time code of 16 characters from the Crockford alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, displayed as `XXXX-XXXX-XXXX-XXXX` (80 bits). It is valid for 5 minutes and for 5 wrong attempts; afterwards the host closes the window. The user types it into the extension's options page. Input is normalized: upper case, spaces and dashes removed, `O`→`0`, `I`/`L`→`1`.
+
+```text
+codeKey    = SHA-256("tb-bridge/2 pairing code\n" + normalizedCode)
+transcript = b64u(SHA-256("tb-bridge/2 pair\n" + hostId + "\n" + extPub + "\n" + hostPub + "\n" + extNonce + "\n" + hostNonce))
+K          = HKDF-SHA256(ikm = ECDH-P256(shared x), salt = codeKey, info = "tb-bridge/2 pairing key\n" + transcript, 32 bytes)
+```
+
+1. `GET /v2/hello` → `{ proto: 2, hostId, app, appVersion, pid, paired, challenge? }`. `hostId` is a stable random identifier of the host installation (not secret).
+2. `POST /v2/pair/start` `{ proto: 2, extPub, extNonce, extVersion, mac: MAC(codeKey, "pair-start", extPub, extNonce) }` where `extPub` is the extension's ephemeral uncompressed P-256 public key and `extNonce` 32 random bytes. The host checks the MAC (a wrong code counts as an attempt), generates its own ephemeral key and nonce and answers `{ proto, hostId, hostPub, hostNonce, app, appVersion, mac: MAC(K, "pair-host", transcript) }`.
+3. The extension derives `K`, verifies the host MAC (proves the host knows the code and took part in the ECDH) and sends `POST /v2/pair/finish` `{ hostId, mac: MAC(K, "pair-ext", transcript) }`.
+4. The host verifies it, stores `K` with a new `pairingId`, the request's `Origin` and the extension version, discards every earlier pairing and session, closes the window and answers `{ ok: true, pairingId, mac: MAC(K, "pair-done", transcript, pairingId) }`. The extension verifies this MAC before storing `{ hostId → pairingId, K }`.
+
+Neither the code nor `K` ever appears in a URL. An observer of the pairing traffic who later learns the code still cannot compute `K` (ECDH). A host keeps **one** pairing: two Thunderbird profiles polling one queue would let a request run in whichever mailbox answered first. An extension may keep pairings with several hosts (keyed by `hostId`) and uses the one matching the host currently on the port.
+
+Errors use `{ ok: false, error, message }` with `error` one of `pairing_not_active`, `pairing_code_invalid`, `pairing_failed`, `rate_limited`, `bad_request`.
+
+## Connection: mutual authentication
+
+1. `GET /v2/hello`. A paired host includes a fresh single-use `challenge` (32 random bytes, valid 30 s). If `hostId` matches no stored pairing the extension stops: **nothing is sent to that host**. A `404` means a host without protocol 2 (outdated); the extension stops too.
+2. `POST /v2/auth` `{ hostId, pairingId, hostNonce: challenge, extNonce, extVersion, mac: MAC(K, "auth-ext", hostId, pairingId, challenge, extNonce) }`.
+3. The host consumes the challenge, checks the pairing id, the origin and the MAC, and answers `{ ok: true, sessionId, idleTimeoutMs, mac: MAC(K, "auth-host", hostId, pairingId, challenge, extNonce, sessionId) }`.
+4. The extension verifies the host MAC. **Only then** does it poll. A host on the port that copied `hostId` but does not know `K` fails here and gets no poll and no result.
+
+```text
+sessionKey = HMAC-SHA256(K, "session\n" + challenge + "\n" + extNonce + "\n" + sessionId)
+```
+
+Refusals: `401` with `error` `not_paired`, `wrong_host`, `pairing_revoked` (the host was unpaired or paired again: pair again), `challenge_invalid`, `origin_mismatch`, `bad_proof`; `429 rate_limited` after many failures. Sessions expire after 10 minutes without a signed request.
+
+## Signed requests and responses
+
+Every request after authentication carries:
+
+```text
+X-TB-Session: sessionId
+X-TB-Ts:      milliseconds since the Unix epoch
+X-TB-Nonce:   16 random bytes (base64url)
+X-TB-Mac:     MAC(sessionKey, "req", METHOD, pathAndQuery, ts, nonce, bodyHash)
+```
+
+`pathAndQuery` is the request target exactly as sent (as the URL parser serializes it). The host rejects (`401`, error `session_invalid`, `origin_mismatch`, `stale`, `bad_nonce`, `replay`, `bad_signature`) a missing or expired session, an `Origin` other than the session's, a timestamp more than 60 s off, a nonce already used in the session, or a wrong MAC. Nonces are remembered longer than timestamps stay valid.
+
+Every response to a signed request carries:
+
+```text
+X-TB-Ts:  milliseconds since the Unix epoch
+X-TB-Mac: MAC(sessionKey, "res", status, requestNonce, ts, responseBodyHash)
+```
+
+The extension discards any response whose MAC is missing or wrong or whose timestamp is stale, drops the session and authenticates again. Because the MAC includes the request nonce, an old signed response (for example an earlier command) cannot be replayed to a new poll. A `401` without a valid MAC only causes re-authentication.
+
+### `GET /v2/poll`
+
+Signed long-poll. The host keeps it open (SuperCLI: 20 s) and answers `200` with the next request, or `204` when none is waiting. The extension polls again immediately after a `200` and after 250 ms after a `204`; after a network error it re-authenticates after 1 s.
 
 ```json
 {
   "id": "req-123",
   "op": "search",
-  "args": {
-    "subject": "invoice",
-    "limit": 20
-  }
+  "args": { "subject": "invoice", "limit": 20 }
 }
 ```
 
 `id` must uniquely identify the request until its result has been received.
 
-### `POST /result?token=...`
+### `POST /v2/result`
 
-The extension posts the completed result as JSON with `Content-Type: application/json; charset=utf-8`. The body is always valid UTF-8: Polish text in results and error messages is sent as-is, and a lone UTF-16 surrogate (e.g. from a broken subject) is escaped as `\udXXX`. Hosts should decode the body as UTF-8.
-
-Success:
+Signed. Body (`Content-Type: application/json; charset=utf-8`, always valid UTF-8; a lone UTF-16 surrogate is escaped as `\udXXX`):
 
 ```json
-{
-  "id": "req-123",
-  "ok": true,
-  "data": {}
-}
+{ "id": "req-123", "ok": true, "data": {} }
+{ "id": "req-123", "ok": false, "error": "Human-readable error" }
 ```
 
-Failure:
+The host answers `204` (signed). A retried identical result for an accepted request is acknowledged again (`204`); a different body for it is `409`.
 
-```json
-{
-  "id": "req-123",
-  "ok": false,
-  "error": "Human-readable error"
-}
-```
+### `POST /v2/attachment-file?id=...&filename=...&content_type=...`
 
-### `POST /attachment-file?...`
+Used by `get_attachment`. Signed; the body hash covers the raw attachment bytes and the query is part of the signed path. The host accepts the upload only after the MAC over the complete body verified, and deletes it otherwise.
 
-Used by `get_attachment`. The extension uploads raw attachment bytes to the host.
+### `GET /v2/message-file?id=...`
 
-Query parameters:
+Used by `import_msg`. Signed; the host returns a previously prepared RFC 822 / `.eml` payload with a signed response.
 
-- `token`
-- `id` — transfer identifier
-- `filename`
-- `content_type`
+### Outdated extensions
 
-The body contains the raw file.
-
-### `GET /message-file?token=...&id=...`
-
-Used by `import_msg`. The host returns a previously prepared RFC 822 / `.eml` payload. A host may, for example, convert an Outlook `.msg` file before queueing the Thunderbird import operation.
-
-## Authentication token
-
-The current source contains a static compatibility token inherited from the original local SuperCLI implementation. It prevents accidental cross-talk between unrelated localhost services, but **it should not be treated as strong authentication**.
-
-Keep the host bound to loopback. Endpoint/token configuration and generated per-install secrets are planned improvements before a stable `1.0` protocol.
+A protocol 2 host answers `/poll`, `/result`, `/health`, `/message-file` and `/attachment-file` (protocol 1) with `426` and `error: extension_outdated` and never dispatches a request to them. SuperCli tells the user to update the extension to 0.10.0 or newer and pair it.
 
 ## Operations
 
@@ -282,18 +310,21 @@ A purge whose native compaction was skipped cannot confirm server EXPUNGE: it re
 
 ## Host implementation guidance
 
-A minimal host needs four pieces:
+A minimal host needs these pieces:
 
-1. a queue for bridge requests,
-2. `/poll` to give requests to Thunderbird,
-3. `/result` to receive responses,
-4. temporary file storage for attachment/message transfer if those features are used.
+1. pairing (`/v2/hello`, `/v2/pair/start`, `/v2/pair/finish`), a UI that shows the one-time code, and protected storage for the pairing secret,
+2. mutual authentication (`/v2/auth`) and verification of every signed request (session, timestamp, nonce, MAC) plus signing of every response,
+3. a queue for bridge requests and `/v2/poll` to give them to Thunderbird,
+4. `/v2/result` to receive responses,
+5. temporary file storage for attachment/message transfer if those features are used.
+
+`extension/bridge-auth.js` is a compact reference for every derivation and canonical string; the SuperCLI host implements the same in Go (`internal/tools/mail/thunderbird_bridge_*.go`), and both repositories test the same known-answer vector.
 
 The host is free to expose any interface on its other side: CLI commands, MCP tools, model function calling, a desktop app, REST, or something else entirely.
 
 ## Compatibility
 
-The protocol is experimental until `1.0`. If you build another host implementation, pin the extension version and expect small field/operation changes while the API is being cleaned up.
+The protocol is experimental until `1.0`. If you build another host implementation, pin the extension version and expect small field/operation changes while the API is being cleaned up. Protocol 2 (extension 0.10.0) is deliberately incompatible with protocol 1 hosts and extensions in both directions: each side fails closed and says which side to update.
 
 ## Result delivery and uncertain outcomes
 

@@ -39,6 +39,13 @@ function fixture({ delivery = async () => ({ ok: true, status: 204 }), create, f
     },
   });
   vm.runInContext(source, context);
+  // The transport (pairing, signatures) is covered by bridge-transport.test.js;
+  // here the signed request layer is a pass-through so delivery semantics are
+  // tested on their own. Top-level function declarations are global bindings.
+  context.bridgeRequest = async (method, path, { body, contentType, signal } = {}) => {
+    const response = await context.fetch(path, { method, body, headers: { "Content-Type": contentType }, signal });
+    return { ok: response.ok, status: response.status, bytes: new Uint8Array(0), text: () => "", json: () => null };
+  };
   return {
     context, posts, folders,
     mutations: () => mutations,
@@ -260,26 +267,6 @@ test("operation limits: reads 120 s, mutations longer", () => {
   assert.equal(f.read('operationTimeoutMs("search")'), 120000);
   assert.ok(f.read('operationTimeoutMs("trash")') > 120000);
   assert.ok(f.read('operationTimeoutMs("compact_folder")') >= f.read('operationTimeoutMs("trash")'));
-});
-
-test("poll loop pauses after HTTP 204 instead of busy-waiting", async () => {
-  let polls = 0;
-  const delays = [];
-  const context = vm.createContext({
-    messenger: { accounts: { list: async () => [] } },
-    console: { warn() {}, log() {} },
-    AbortController, TextEncoder, Date,
-    // Record requested delays without ever firing them, freezing the loop.
-    setTimeout: (_, ms) => { delays.push(ms); return 0; }, clearTimeout() {},
-    fetch: async url => {
-      if (url.includes("/poll?")) { polls++; return { status: 204, ok: true }; }
-      return { ok: true, status: 204 };
-    },
-  });
-  vm.runInContext(source, context);
-  for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(polls, 1, "a 204 must not immediately trigger another poll");
-  assert.deepEqual(delays, [250]);
 });
 
 test("results and errors are posted as UTF-8 JSON with Polish characters intact", async () => {
